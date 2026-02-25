@@ -1,0 +1,71 @@
+{
+  "formation_parameters": {
+    "side_length": 800.0,
+    "min_separation": 400.0,
+    "obstacle_clearance": 200.0,
+    "pos_tolerance": 50.0,
+    "yaw_tolerance": 5.0,
+    "max_velocity": 300.0,
+    "max_acceleration": 100.0,
+    "formation_angle": 0.0,
+    "maneuver_time": 10.0,
+    "inflation_radius": 150.0
+  },
+  "robot_parameters": {
+    "robot1_ip": "192.168.1.253",
+    "robot1_port": 8101,
+    "robot2_ip": "192.168.1.254",
+    "robot2_port": 8101,
+    "control_rate": 10.0,
+    "map_update_rate": 3.0,
+    "viz_update_rate": 5.0
+  },
+  "safety_parameters": {
+    "emergency_stop_distance": 100.0,
+    "collision_warning_distance": 200.0,
+    "battery_warning_voltage": 11.5,
+    "battery_critical_voltage": 11.0,
+    "max_formation_error": 100.0,
+    "max_velocity_error": 50.0
+  },
+  "visualization_parameters": {
+    "room_size": [10000, 10000, 3000],
+    "grid_resolution": 50.0,
+    "trajectory_length": 200,
+    "sonar_cone_angle": 45.0,
+    "sonar_range": 1000.0,
+    "update_frequency": 10.0
+  },
+  "obstacles": [
+    {
+      "name": "Obstacle 1",
+      "position": [2000, 1500, 0],
+      "radius": 400,
+      "height": 600
+    },
+    {
+      "name": "Obstacle 2", 
+      "position": [-1800, 2000, 0],
+      "radius": 300,
+      "height": 500
+    },
+    {
+      "name": "Obstacle 3",
+      "position": [1000, -2000, 0],
+      "radius": 500,
+      "height": 700
+    },
+    {
+      "name": "Obstacle 4",
+      "position": [-2500, -1500, 0],
+      "radius": 350,
+      "height": 550
+    },
+    {
+      "name": "Central Obstacle",
+      "position": [0, 0, 0],
+      "radius": 200,
+      "height": 400
+    }
+  ]
+}

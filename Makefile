@@ -263,14 +263,17 @@ ifeq ($(host),MINGW32)
 		ArSignalHandler_WIN.cpp
 else
   CFILES+=ArSocket_LIN.cpp \
-		ArJoyHandler_LIN.cpp \
 		ArSerialConnection_LIN.cpp \
 		ArSignalHandler_LIN.cpp \
 		ArVersalogicIO.cpp \
 		ArSystemStatus.cpp 
-  ifneq ($(host),Darwin)
+  ifeq ($(host),Darwin)
+		# macOS-specific
+    CFILES+=ArJoyHandler_MAC.cpp
+  else
 		# Very Linux-specific
-    CFILES+=ArMTXIO.cpp
+    CFILES+=ArMTXIO.cpp \
+		ArJoyHandler_LIN.cpp
   endif
 endif
 
