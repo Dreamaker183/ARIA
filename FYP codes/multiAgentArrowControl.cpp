@@ -13,6 +13,15 @@ Controls:
 #include "Aria.h"
 #include <vector>
 #include <string>
+#include <map>
+#include <fstream>
+#include <iostream>
+
+// Global recording state
+static bool gIsRecording = false;
+static int gNextRecordSlot = 1;
+static std::string gSlotNames[3] = {"record_1", "record_2", "record_3"};
+static std::string gStatusMsg = "Ready";
 #include <algorithm>
 #include <cstring>
 
@@ -77,6 +86,29 @@ private:
   ArFunctorC<MultiAgentArrowControl> myInvLeftCB;
   ArFunctorC<MultiAgentArrowControl> myInvRightCB;
 
+  ArFunctorC<MultiAgentArrowControl> myRecordCB;
+  ArFunctorC<MultiAgentArrowControl> myPlay1CB;
+  ArFunctorC<MultiAgentArrowControl> myPlay2CB;
+  ArFunctorC<MultiAgentArrowControl> myPlay3CB;
+  ArFunctorC<MultiAgentArrowControl> mySaveCB;
+
+  void keyRecord();
+  void keyPlay(int slot);
+  void keyPlay1();
+  void keyPlay2();
+  void keyPlay3();
+  void keySave();
+
+  struct RecordState {
+    std::vector<std::pair<double, double>> history;
+  };
+  std::map<int, RecordState> myRecords;
+  int myPlayingSlot;
+  size_t myPlaybackIndex;
+
+  void saveRecording(int slot, const std::string& name);
+  void loadRecording(int slot, const std::string& name);
+
   void controlTask();
 
   void keyUp();
@@ -102,6 +134,9 @@ private:
   void setIndividualCommand(int targetId, double v, double w, bool enabled, const char* label);
   double clampDelta(double target, double current, double maxStep);
   bool applySonarSafety(double& targetV, double& targetW);
+
+public:
+  static void printUI();
 };
 
 MultiAgentArrowControl::MultiAgentArrowControl(ArRobot* robot, int robotId) :
@@ -126,9 +161,19 @@ MultiAgentArrowControl::MultiAgentArrowControl(ArRobot* robot, int robotId) :
   myInvUpCB(this, &MultiAgentArrowControl::keyInvUp),
   myInvDownCB(this, &MultiAgentArrowControl::keyInvDown),
   myInvLeftCB(this, &MultiAgentArrowControl::keyInvLeft),
-  myInvRightCB(this, &MultiAgentArrowControl::keyInvRight)
+  myInvRightCB(this, &MultiAgentArrowControl::keyInvRight),
+  myRecordCB(this, &MultiAgentArrowControl::keyRecord),
+  myPlay1CB(this, &MultiAgentArrowControl::keyPlay1),
+  myPlay2CB(this, &MultiAgentArrowControl::keyPlay2),
+  myPlay3CB(this, &MultiAgentArrowControl::keyPlay3),
+  mySaveCB(this, &MultiAgentArrowControl::keySave),
+  myPlayingSlot(-1),
+  myPlaybackIndex(0)
 {
   gControllers.push_back(this);
+  loadRecording(1, gSlotNames[0]);
+  loadRecording(2, gSlotNames[1]);
+  loadRecording(3, gSlotNames[2]);
 }
 
 MultiAgentArrowControl::~MultiAgentArrowControl()
@@ -186,6 +231,11 @@ void MultiAgentArrowControl::addKeyHandlers(ArKeyHandler* keyHandler)
   keyHandler->addKeyHandler('b', &myStopCB);
   keyHandler->addKeyHandler('x', &myStopCB); // Added 'x' as emergency stop
   keyHandler->addKeyHandler('q', &myQuitCB);
+  keyHandler->addKeyHandler('r', &myRecordCB);
+  keyHandler->addKeyHandler('1', &myPlay1CB);
+  keyHandler->addKeyHandler('2', &myPlay2CB);
+  keyHandler->addKeyHandler('3', &myPlay3CB);
+  keyHandler->addKeyHandler('s', &mySaveCB);
 }
 
 void MultiAgentArrowControl::keyUp()
@@ -210,11 +260,17 @@ void MultiAgentArrowControl::keyRight()
 
 void MultiAgentArrowControl::keyStop()
 {
+  if (gIsRecording) {
+    gIsRecording = false;
+    gStatusMsg = "RECORDING ABORTED.";
+  }
   setAllCommands(0.0, 0.0, false, "STOP ALL");
   for (size_t i = 0; i < gControllers.size(); ++i) {
       gControllers[i]->myLastVel = 0;
       gControllers[i]->myLastRotVel = 0;
+      gControllers[i]->myPlayingSlot = -1; // stop playback
   }
+  printUI();
 }
 
 void MultiAgentArrowControl::keyQuit()
@@ -258,23 +314,158 @@ void MultiAgentArrowControl::keyIndRight() { setIndividualCommand(1, 0.0, -myPar
 
 void MultiAgentArrowControl::keyInvUp()
 {
-  setIndividualCommand(2, -myParams.slowLinearVel, 0.0, true, "TFGH_UP_INV");
-  setIndividualCommand(3, -myParams.slowLinearVel, 0.0, true, "TFGH_UP_INV");
+  setIndividualCommand(2, myParams.slowLinearVel, 0.0, true, "TFGH_UP_R2");
+  setIndividualCommand(3, -myParams.slowLinearVel, 0.0, true, "TFGH_UP_R3");
 }
 void MultiAgentArrowControl::keyInvDown()
 {
-  setIndividualCommand(2, myParams.slowLinearVel, 0.0, true, "TFGH_DOWN_INV");
-  setIndividualCommand(3, myParams.slowLinearVel, 0.0, true, "TFGH_DOWN_INV");
+  setIndividualCommand(2, -myParams.slowLinearVel, 0.0, true, "TFGH_DOWN_R2");
+  setIndividualCommand(3, myParams.slowLinearVel, 0.0, true, "TFGH_DOWN_R3");
 }
 void MultiAgentArrowControl::keyInvLeft()
 {
-  setIndividualCommand(2, 0.0, -myParams.slowRotVel, true, "TFGH_LEFT_INV");
-  setIndividualCommand(3, 0.0, -myParams.slowRotVel, true, "TFGH_LEFT_INV");
+  setIndividualCommand(2, 0.0, myParams.slowRotVel, true, "TFGH_LEFT_R2");
+  setIndividualCommand(3, 0.0, -myParams.slowRotVel, true, "TFGH_LEFT_R3");
 }
 void MultiAgentArrowControl::keyInvRight()
 {
-  setIndividualCommand(2, 0.0, myParams.slowRotVel, true, "TFGH_RIGHT_INV");
-  setIndividualCommand(3, 0.0, myParams.slowRotVel, true, "TFGH_RIGHT_INV");
+  setIndividualCommand(2, 0.0, -myParams.slowRotVel, true, "TFGH_RIGHT_R2");
+  setIndividualCommand(3, 0.0, myParams.slowRotVel, true, "TFGH_RIGHT_R3");
+}
+
+void MultiAgentArrowControl::keyRecord()
+{
+  if (gIsRecording) {
+    gIsRecording = false;
+    gStatusMsg = "Saved loop to Slot " + std::to_string(gNextRecordSlot) + " (" + gSlotNames[gNextRecordSlot-1] + ")";
+    
+    for (size_t i = 0; i < gControllers.size(); ++i) {
+      gControllers[i]->saveRecording(gNextRecordSlot, gSlotNames[gNextRecordSlot-1]);
+    }
+
+    gNextRecordSlot++;
+    if (gNextRecordSlot > 3) gNextRecordSlot = 1;
+  } else {
+    for (size_t i = 0; i < gControllers.size(); ++i) {
+      gControllers[i]->myRecords[gNextRecordSlot].history.clear();
+      gControllers[i]->myPlayingSlot = -1; // stop playing
+    }
+    gIsRecording = true;
+    gStatusMsg = "RECORDING to Slot " + std::to_string(gNextRecordSlot) + "...";
+  }
+  printUI();
+}
+
+void MultiAgentArrowControl::keyPlay(int slot)
+{
+  if (gIsRecording) {
+    gStatusMsg = "Cannot play while recording. Press 'r' to stop first.";
+    printUI();
+    return;
+  }
+  gStatusMsg = "PLAYING Slot " + std::to_string(slot) + " (" + gSlotNames[slot-1] + ")";
+  for (size_t i = 0; i < gControllers.size(); ++i) {
+    gControllers[i]->myPlayingSlot = slot;
+    gControllers[i]->myPlaybackIndex = 0;
+  }
+  printUI();
+}
+void MultiAgentArrowControl::keyPlay1() { keyPlay(1); }
+void MultiAgentArrowControl::keyPlay2() { keyPlay(2); }
+void MultiAgentArrowControl::keyPlay3() { keyPlay(3); }
+
+void MultiAgentArrowControl::keySave()
+{
+  if (gIsRecording) {
+      gStatusMsg = "Cannot rename while actively recording!";
+      printUI();
+      return;
+  }
+
+  // Clear previous lines to make console readable for input
+  printf("\033[2J\033[H");
+  std::cout << "--- Rename Saved Recording ---\n";
+  std::cout << "Which slot to rename and save? (1, 2, or 3) [Enter 0 to cancel]: ";
+  int slot = 0;
+  std::cin >> slot;
+  if(slot >= 1 && slot <= 3) {
+      std::cout << "Enter new file name: ";
+      std::string newName;
+      std::cin >> newName;
+      gSlotNames[slot-1] = newName;
+      
+      for (size_t i = 0; i < gControllers.size(); ++i) {
+        gControllers[i]->saveRecording(slot, newName);
+      }
+      gStatusMsg = "Renamed Slot " + std::to_string(slot) + " to '" + newName + "'";
+  } else {
+      gStatusMsg = "Rename cancelled.";
+  }
+  printUI();
+}
+
+void MultiAgentArrowControl::saveRecording(int slot, const std::string& name)
+{
+  std::string filename = "Robot" + std::to_string(myId) + "_" + name + ".txt";
+  std::ofstream out(filename.c_str());
+  if (out.is_open()) {
+    for (size_t i = 0; i < myRecords[slot].history.size(); ++i) {
+       out << myRecords[slot].history[i].first << " " << myRecords[slot].history[i].second << "\n";
+    }
+    out.close();
+  }
+}
+
+void MultiAgentArrowControl::loadRecording(int slot, const std::string& name)
+{
+  std::string filename = "Robot" + std::to_string(myId) + "_" + name + ".txt";
+  std::ifstream in(filename.c_str());
+  if (in.is_open()) {
+    myRecords[slot].history.clear();
+    double v, w;
+    while (in >> v >> w) {
+      myRecords[slot].history.push_back(std::make_pair(v, w));
+    }
+    in.close();
+  }
+}
+
+void MultiAgentArrowControl::printUI()
+{
+    // Clear screen and position cursor to top
+    printf("\033[2J\033[H");
+    printf("===================================================\n");
+    printf("       SYNCHRONIZED SWARM ROBOT CONTROLLER\n");
+    printf("===================================================\n\n");
+    
+    printf("--- CONTROLS ---\n");
+    printf("   [Arrow Keys] : Move Robot 1 Individually\n");
+    printf("   [ T F G H ]  : Move Robot 2 and 3 in OPPOSITE directions\n");
+    printf("   [ W A S D ]  : Move ALL robots together\n");
+    printf("   [ SPACE/X ]  : STOP ALL robots unconditionally\n");
+    printf("   [    Q    ]  : Quit Program\n\n");
+    
+    printf("--- RECORD & PLAYBACK ---\n");
+    printf("   [    R    ]  : Start/Stop sequence recording\n");
+    printf("   [ 1, 2, 3 ]  : Playback recorded sequences\n");
+    printf("   [    S    ]  : Save & Rename a recording slot\n\n");
+    
+    printf("--- LOADED RECORDINGS ---\n");
+    for(int i = 0; i < 3; i++) {
+        size_t len = 0;
+        if (!gControllers.empty()) len = gControllers[0]->myRecords[i+1].history.size();
+        printf("   Slot %d: %s (%zu frames)\n", i+1, gSlotNames[i].c_str(), len);
+    }
+    
+    printf("\n===================================================\n");
+    printf(">> STATUS: %s\n", gStatusMsg.c_str());
+    if (gIsRecording) {
+        printf(">> [ RECORDING ACTIVE ] >> \n");
+    } else {
+        printf("\n");
+    }
+    printf("===================================================\n");
+    fflush(stdout);
 }
 
 double MultiAgentArrowControl::clampDelta(double target, double current, double maxStep)
@@ -294,6 +485,9 @@ bool MultiAgentArrowControl::applySonarSafety(double& targetV, double& targetW)
   if (targetV > 1.0)
   {
     const double front = sanitizeRange(myRobot->getClosestSonarRange(-60.0, 60.0));
+    (void)front; // prevent unused warning
+    // SONAR OVERRIDE: Keep reading sonar but do NOT stop or alter velocity
+    /*
     if (front < myParams.safeDistance)
     {
       targetV = 0.0;
@@ -307,12 +501,16 @@ bool MultiAgentArrowControl::applySonarSafety(double& targetV, double& targetW)
       if (++blockCount % 10 == 0) ArLog::log(ArLog::Normal, "Robot %d: BLOCKED by sonar (%.1fmm)", myId, front);
       return true;
     }
+    */
   }
   else if (targetV < -1.0)
   {
     const double rearLeft = sanitizeRange(myRobot->getClosestSonarRange(120.0, 179.0));
     const double rearRight = sanitizeRange(myRobot->getClosestSonarRange(-179.0, -120.0));
     const double rear = std::min(rearLeft, rearRight);
+    (void)rear; // prevent unused warning
+    // SONAR OVERRIDE
+    /*
     if (rear < myParams.safeDistance)
     {
       targetV = 0.0;
@@ -322,6 +520,7 @@ bool MultiAgentArrowControl::applySonarSafety(double& targetV, double& targetW)
       }
       return true;
     }
+    */
   }
 
   return false;
@@ -331,6 +530,28 @@ void MultiAgentArrowControl::controlTask()
 {
   double targetV = myCommandEnabled ? myTargetVel : 0.0;
   double targetW = myCommandEnabled ? myTargetRotVel : 0.0;
+
+  // Playback logic overrides manual target
+  if (myPlayingSlot != -1) {
+    if (myPlaybackIndex < myRecords[myPlayingSlot].history.size()) {
+       targetV = myRecords[myPlayingSlot].history[myPlaybackIndex].first;
+       targetW = myRecords[myPlayingSlot].history[myPlaybackIndex].second;
+       myPlaybackIndex++;
+       myCommandEnabled = true;
+    } else {
+       myPlayingSlot = -1; // Finished
+       targetV = 0.0;
+       targetW = 0.0;
+       myCommandEnabled = false;
+       if (myId == 1) {
+           gStatusMsg = "Playback Finished.";
+           printUI();
+       }
+    }
+  } else if (gIsRecording) {
+    // Record current intended targets
+    myRecords[gNextRecordSlot].history.push_back(std::make_pair(targetV, targetW));
+  }
 
   applySonarSafety(targetV, targetW);
 
@@ -482,12 +703,7 @@ int main(int argc, char** argv)
     }
 
     ArLog::log(ArLog::Normal, "ArrowControl: %d robots connected", connectedCount);
-    printf("\nSynchronized Arrow Control Ready\n");
-    printf("WASD keys: move ALL robots together\n");
-    printf("Arrow keys: move Robot 1 INDIVIDUALLY\n");
-    printf("TFGH keys: move Robot 2 and 3 INVERTED\n");
-    printf("SPACE, b, or x: STOP ALL robots | q: quit\n\n");
-    fflush(stdout);
+    MultiAgentArrowControl::printUI();
 
     while (true)
     {
@@ -504,9 +720,12 @@ int main(int argc, char** argv)
       ArUtil::sleep(100);
     }
 
+    Aria::setKeyHandler(NULL);
+
     for (size_t i = 0; i < robots.size(); ++i)
     {
       if (robots[i].robot) {
+        robots[i].robot->disconnect(); // Ensure TCP closes properly
         robots[i].robot->stopRunning();
         robots[i].robot->waitForRunExit();
       }
