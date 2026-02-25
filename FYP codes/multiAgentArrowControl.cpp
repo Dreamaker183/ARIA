@@ -54,8 +54,8 @@ private:
     double maxRotVel = 25.0;       // deg/s
     double maxVelStep = 10.0;      // mm/s per cycle
     double maxRotStep = 3.0;       // deg/s per cycle
-    double safeDistance = 800.0;   // mm
-    double criticalDistance = 450.0; // mm
+    double safeDistance = 500.0;   // mm (reduced from 800 to prevent phantom stops)
+    double criticalDistance = 300.0; // mm (reduced from 450)
     double avoidTurnVel = 16.0;    // deg/s
   } myParams;
 
@@ -67,6 +67,16 @@ private:
   ArFunctorC<MultiAgentArrowControl> myStopCB;
   ArFunctorC<MultiAgentArrowControl> myQuitCB;
 
+  ArFunctorC<MultiAgentArrowControl> myIndUpCB;
+  ArFunctorC<MultiAgentArrowControl> myIndDownCB;
+  ArFunctorC<MultiAgentArrowControl> myIndLeftCB;
+  ArFunctorC<MultiAgentArrowControl> myIndRightCB;
+
+  ArFunctorC<MultiAgentArrowControl> myInvUpCB;
+  ArFunctorC<MultiAgentArrowControl> myInvDownCB;
+  ArFunctorC<MultiAgentArrowControl> myInvLeftCB;
+  ArFunctorC<MultiAgentArrowControl> myInvRightCB;
+
   void controlTask();
 
   void keyUp();
@@ -76,7 +86,20 @@ private:
   void keyStop();
   void keyQuit();
 
+  // Individual Robot 1 controls (Arrow Keys)
+  void keyIndUp();
+  void keyIndDown();
+  void keyIndLeft();
+  void keyIndRight();
+
+  // Inverted Robot 2 & 3 controls (TFGH)
+  void keyInvUp();
+  void keyInvDown();
+  void keyInvLeft();
+  void keyInvRight();
+
   void setAllCommands(double v, double w, bool enabled, const char* label);
+  void setIndividualCommand(int targetId, double v, double w, bool enabled, const char* label);
   double clampDelta(double target, double current, double maxStep);
   bool applySonarSafety(double& targetV, double& targetW);
 };
@@ -95,7 +118,15 @@ MultiAgentArrowControl::MultiAgentArrowControl(ArRobot* robot, int robotId) :
   myLeftCB(this, &MultiAgentArrowControl::keyLeft),
   myRightCB(this, &MultiAgentArrowControl::keyRight),
   myStopCB(this, &MultiAgentArrowControl::keyStop),
-  myQuitCB(this, &MultiAgentArrowControl::keyQuit)
+  myQuitCB(this, &MultiAgentArrowControl::keyQuit),
+  myIndUpCB(this, &MultiAgentArrowControl::keyIndUp),
+  myIndDownCB(this, &MultiAgentArrowControl::keyIndDown),
+  myIndLeftCB(this, &MultiAgentArrowControl::keyIndLeft),
+  myIndRightCB(this, &MultiAgentArrowControl::keyIndRight),
+  myInvUpCB(this, &MultiAgentArrowControl::keyInvUp),
+  myInvDownCB(this, &MultiAgentArrowControl::keyInvDown),
+  myInvLeftCB(this, &MultiAgentArrowControl::keyInvLeft),
+  myInvRightCB(this, &MultiAgentArrowControl::keyInvRight)
 {
   gControllers.push_back(this);
 }
@@ -136,10 +167,16 @@ void MultiAgentArrowControl::addKeyHandlers(ArKeyHandler* keyHandler)
 {
   if (!keyHandler) return;
 
-  keyHandler->addKeyHandler(ArKeyHandler::UP, &myUpCB);
-  keyHandler->addKeyHandler(ArKeyHandler::DOWN, &myDownCB);
-  keyHandler->addKeyHandler(ArKeyHandler::LEFT, &myLeftCB);
-  keyHandler->addKeyHandler(ArKeyHandler::RIGHT, &myRightCB);
+  keyHandler->addKeyHandler(ArKeyHandler::UP, &myIndUpCB);
+  keyHandler->addKeyHandler(ArKeyHandler::DOWN, &myIndDownCB);
+  keyHandler->addKeyHandler(ArKeyHandler::LEFT, &myIndLeftCB);
+  keyHandler->addKeyHandler(ArKeyHandler::RIGHT, &myIndRightCB);
+
+  keyHandler->addKeyHandler('t', &myInvUpCB);
+  keyHandler->addKeyHandler('g', &myInvDownCB);
+  keyHandler->addKeyHandler('f', &myInvLeftCB);
+  keyHandler->addKeyHandler('h', &myInvRightCB);
+
   keyHandler->addKeyHandler(ArKeyHandler::SPACE, &myStopCB);
 
   keyHandler->addKeyHandler('w', &myUpCB);
@@ -147,6 +184,7 @@ void MultiAgentArrowControl::addKeyHandlers(ArKeyHandler* keyHandler)
   keyHandler->addKeyHandler('a', &myLeftCB);
   keyHandler->addKeyHandler('d', &myRightCB);
   keyHandler->addKeyHandler('b', &myStopCB);
+  keyHandler->addKeyHandler('x', &myStopCB); // Added 'x' as emergency stop
   keyHandler->addKeyHandler('q', &myQuitCB);
 }
 
@@ -172,7 +210,11 @@ void MultiAgentArrowControl::keyRight()
 
 void MultiAgentArrowControl::keyStop()
 {
-  setAllCommands(0.0, 0.0, false, "STOP");
+  setAllCommands(0.0, 0.0, false, "STOP ALL");
+  for (size_t i = 0; i < gControllers.size(); ++i) {
+      gControllers[i]->myLastVel = 0;
+      gControllers[i]->myLastRotVel = 0;
+  }
 }
 
 void MultiAgentArrowControl::keyQuit()
@@ -190,7 +232,49 @@ void MultiAgentArrowControl::setAllCommands(double v, double w, bool enabled, co
     c->myTargetRotVel = w;
     c->myCommandEnabled = enabled;
   }
-  ArLog::log(ArLog::Normal, "ArrowControl: %s  (v=%.1f, w=%.1f)", label, v, w);
+  ArLog::log(ArLog::Normal, "ArrowControl (ALL): %s  (v=%.1f, w=%.1f)", label, v, w);
+}
+
+void MultiAgentArrowControl::setIndividualCommand(int targetId, double v, double w, bool enabled, const char* label)
+{
+  for (size_t i = 0; i < gControllers.size(); ++i)
+  {
+    MultiAgentArrowControl* c = gControllers[i];
+    if (c->myId == targetId)
+    {
+      c->myTargetVel = v;
+      c->myTargetRotVel = w;
+      c->myCommandEnabled = enabled;
+      ArLog::log(ArLog::Normal, "ArrowControl (Robot %d): %s (v=%.1f, w=%.1f)", targetId, label, v, w);
+      return;
+    }
+  }
+}
+
+void MultiAgentArrowControl::keyIndUp()    { setIndividualCommand(1, myParams.slowLinearVel, 0.0, true, "UP"); }
+void MultiAgentArrowControl::keyIndDown()  { setIndividualCommand(1, -myParams.slowLinearVel, 0.0, true, "DOWN"); }
+void MultiAgentArrowControl::keyIndLeft()  { setIndividualCommand(1, 0.0, myParams.slowRotVel, true, "LEFT"); }
+void MultiAgentArrowControl::keyIndRight() { setIndividualCommand(1, 0.0, -myParams.slowRotVel, true, "RIGHT"); }
+
+void MultiAgentArrowControl::keyInvUp()
+{
+  setIndividualCommand(2, -myParams.slowLinearVel, 0.0, true, "TFGH_UP_INV");
+  setIndividualCommand(3, -myParams.slowLinearVel, 0.0, true, "TFGH_UP_INV");
+}
+void MultiAgentArrowControl::keyInvDown()
+{
+  setIndividualCommand(2, myParams.slowLinearVel, 0.0, true, "TFGH_DOWN_INV");
+  setIndividualCommand(3, myParams.slowLinearVel, 0.0, true, "TFGH_DOWN_INV");
+}
+void MultiAgentArrowControl::keyInvLeft()
+{
+  setIndividualCommand(2, 0.0, -myParams.slowRotVel, true, "TFGH_LEFT_INV");
+  setIndividualCommand(3, 0.0, -myParams.slowRotVel, true, "TFGH_LEFT_INV");
+}
+void MultiAgentArrowControl::keyInvRight()
+{
+  setIndividualCommand(2, 0.0, myParams.slowRotVel, true, "TFGH_RIGHT_INV");
+  setIndividualCommand(3, 0.0, myParams.slowRotVel, true, "TFGH_RIGHT_INV");
 }
 
 double MultiAgentArrowControl::clampDelta(double target, double current, double maxStep)
@@ -219,6 +303,8 @@ bool MultiAgentArrowControl::applySonarSafety(double& targetV, double& targetW)
         const double right = sanitizeRange(myRobot->getClosestSonarRange(-100.0, -15.0));
         targetW = (left >= right) ? myParams.avoidTurnVel : -myParams.avoidTurnVel;
       }
+      static int blockCount = 0;
+      if (++blockCount % 10 == 0) ArLog::log(ArLog::Normal, "Robot %d: BLOCKED by sonar (%.1fmm)", myId, front);
       return true;
     }
   }
@@ -348,6 +434,7 @@ int main(int argc, char** argv)
       if (r.connector->connectRobot())
       {
         ArLog::log(ArLog::Normal, "ArrowControl: Robot %d connected! (Name: %s)", r.id, r.robot->getRobotName());
+        r.robot->setConnectionTimeoutTime(8000); // Tolerate up to 8sec of lag
         r.robot->runAsync(true);
         ArUtil::sleep(500); // Wait for connection to settle
         r.control = new MultiAgentArrowControl(r.robot, r.id);
@@ -396,8 +483,10 @@ int main(int argc, char** argv)
 
     ArLog::log(ArLog::Normal, "ArrowControl: %d robots connected", connectedCount);
     printf("\nSynchronized Arrow Control Ready\n");
-    printf("Arrow keys (or WASD): move all robots together\n");
-    printf("SPACE or b: stop all | q: quit\n\n");
+    printf("WASD keys: move ALL robots together\n");
+    printf("Arrow keys: move Robot 1 INDIVIDUALLY\n");
+    printf("TFGH keys: move Robot 2 and 3 INVERTED\n");
+    printf("SPACE, b, or x: STOP ALL robots | q: quit\n\n");
     fflush(stdout);
 
     while (true)
