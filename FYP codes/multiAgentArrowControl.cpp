@@ -22,6 +22,9 @@ static bool gIsRecording = false;
 static int gNextRecordSlot = 1;
 static std::string gSlotNames[3] = {"record_1", "record_2", "record_3"};
 static std::string gStatusMsg = "Ready";
+static volatile bool gPerRobotBlocked[4] = {false, false, false, false}; // per-robot sonar flags (index = robot ID)
+static int gBlockingRobotId = 0;
+static double gBlockingDistance = 0.0;
 #include <algorithm>
 #include <cstring>
 #include <signal.h>
@@ -36,6 +39,18 @@ static std::string gStatusMsg = "Ready";
 class MultiAgentArrowControl;
 static std::vector<MultiAgentArrowControl*> gControllers;
 static volatile bool gShutdownRequested = false;
+
+// UDP telemetry broadcast for 2D map visualizer
+static int gUdpSocket = -1;
+static struct sockaddr_in gVisualizerAddr;
+
+struct RobotStateMsg {
+  int robot_id;
+  int reserved;  // padding / future use
+  double x, y, theta;
+  double v, w;
+  double sonar[8];
+};
 
 class MultiAgentArrowControl
 {
@@ -65,8 +80,9 @@ private:
     double maxRotVel = 25.0;       // deg/s
     double maxVelStep = 10.0;      // mm/s per cycle
     double maxRotStep = 3.0;       // deg/s per cycle
-    double safeDistance = 500.0;   // mm (reduced from 800 to prevent phantom stops)
-    double criticalDistance = 300.0; // mm (reduced from 450)
+    double safeDistance = 250.0;   // mm — coordinated stop distance (front)
+    double rearSafeDistance = 200.0; // mm — coordinated stop distance (rear)
+    double criticalDistance = 300.0; // mm (unused but kept for reference)
     double avoidTurnVel = 16.0;    // deg/s
   } myParams;
 
@@ -197,8 +213,11 @@ void MultiAgentArrowControl::run()
   myRobot->addUserTask("MultiAgentArrowControl", 100, &myTaskCB);
   myRobot->lock();
   myRobot->enableMotors();
+  myRobot->enableSonar();
+  myRobot->comInt(ArCommands::SONAR, 1); // Force-enable sonar via direct command
   myRobot->unlock();
-  ArLog::log(ArLog::Normal, "ArrowControl: Robot %d ready", myId);
+  ArLog::log(ArLog::Normal, "ArrowControl: Robot %d ready (motors + sonar enabled, %d sonar sensors)", 
+             myId, myRobot->getNumSonar());
 }
 
 void MultiAgentArrowControl::stop()
@@ -462,13 +481,23 @@ void MultiAgentArrowControl::printUI()
     printf("\n--- ROBOTS ---\n");
     for(size_t i = 0; i < gControllers.size(); i++) {
         bool conn = gControllers[i]->myRobot->isConnected();
-        printf("   Robot %d: %s\n", gControllers[i]->myId, conn ? "CONNECTED" : "DISCONNECTED");
+        int numSonar = gControllers[i]->myRobot->getNumSonar();
+        double frontR = gControllers[i]->myRobot->getClosestSonarRange(-60.0, 60.0);
+        double rearL = gControllers[i]->myRobot->getClosestSonarRange(120.0, 179.0);
+        double rearR = gControllers[i]->myRobot->getClosestSonarRange(-179.0, -120.0);
+        if (frontR <= 0) frontR = 9999;
+        double rearD = std::min(rearL > 0 ? rearL : 9999.0, rearR > 0 ? rearR : 9999.0);
+        const char* blocked = gPerRobotBlocked[gControllers[i]->myId] ? " [BLOCKED]" : "";
+        printf("   Robot %d: %s  Sonar:%d  F:%.0fmm R:%.0fmm%s\n", 
+               gControllers[i]->myId, conn ? "OK" : "DOWN", numSonar, frontR, rearD, blocked);
     }
     
     printf("\n===================================================\n");
     printf(">> STATUS: %s\n", gStatusMsg.c_str());
     if (gIsRecording) {
         printf(">> [ RECORDING ACTIVE ] >> \n");
+    } else if (gPerRobotBlocked[1] || gPerRobotBlocked[2] || gPerRobotBlocked[3]) {
+        printf(">> [ SONAR BLOCKED — Robot %d detected obstacle at %.0fmm ] >> \n", gBlockingRobotId, gBlockingDistance);
     } else {
         printf("\n");
     }
@@ -490,45 +519,45 @@ bool MultiAgentArrowControl::applySonarSafety(double& targetV, double& targetW)
     return (r > 0.0) ? r : 5000.0;
   };
 
-  if (targetV > 1.0)
+  bool thisRobotBlocked = false;
+
+  // Always scan front sonar
+  const double front = sanitizeRange(myRobot->getClosestSonarRange(-60.0, 60.0));
+  if (front < myParams.safeDistance && targetV > 1.0)
   {
-    const double front = sanitizeRange(myRobot->getClosestSonarRange(-60.0, 60.0));
-    (void)front; // prevent unused warning
-    // SONAR OVERRIDE: Keep reading sonar but do NOT stop or alter velocity
-    /*
-    if (front < myParams.safeDistance)
-    {
-      targetV = 0.0;
-      if (front < myParams.criticalDistance && fabs(targetW) < 1.0)
-      {
-        const double left = sanitizeRange(myRobot->getClosestSonarRange(15.0, 100.0));
-        const double right = sanitizeRange(myRobot->getClosestSonarRange(-100.0, -15.0));
-        targetW = (left >= right) ? myParams.avoidTurnVel : -myParams.avoidTurnVel;
-      }
-      static int blockCount = 0;
-      if (++blockCount % 10 == 0) ArLog::log(ArLog::Normal, "Robot %d: BLOCKED by sonar (%.1fmm)", myId, front);
-      return true;
-    }
-    */
+    thisRobotBlocked = true;
+    gBlockingRobotId = myId;
+    gBlockingDistance = front;
   }
-  else if (targetV < -1.0)
+
+  // Always scan rear sonar
+  const double rearLeft = sanitizeRange(myRobot->getClosestSonarRange(120.0, 179.0));
+  const double rearRight = sanitizeRange(myRobot->getClosestSonarRange(-179.0, -120.0));
+  const double rear = std::min(rearLeft, rearRight);
+  if (rear < myParams.rearSafeDistance && targetV < -1.0)
   {
-    const double rearLeft = sanitizeRange(myRobot->getClosestSonarRange(120.0, 179.0));
-    const double rearRight = sanitizeRange(myRobot->getClosestSonarRange(-179.0, -120.0));
-    const double rear = std::min(rearLeft, rearRight);
-    (void)rear; // prevent unused warning
-    // SONAR OVERRIDE
-    /*
-    if (rear < myParams.safeDistance)
-    {
-      targetV = 0.0;
-      if (rear < myParams.criticalDistance && fabs(targetW) < 1.0)
-      {
-        targetW = myParams.avoidTurnVel;
-      }
-      return true;
+    thisRobotBlocked = true;
+    gBlockingRobotId = myId;
+    gBlockingDistance = rear;
+  }
+
+  // Update THIS robot's flag (no race condition since each robot writes its own slot)
+  gPerRobotBlocked[myId] = thisRobotBlocked;
+
+  // Check if ANY robot is blocked
+  bool anyBlocked = false;
+  for (int i = 1; i <= 3; i++) {
+    if (gPerRobotBlocked[i]) {
+      anyBlocked = true;
+      break;
     }
-    */
+  }
+
+  if (anyBlocked)
+  {
+    targetV = 0.0;
+    targetW = 0.0;
+    return true;
   }
 
   return false;
@@ -561,7 +590,20 @@ void MultiAgentArrowControl::controlTask()
     myRecords[gNextRecordSlot].history.push_back(std::make_pair(targetV, targetW));
   }
 
-  applySonarSafety(targetV, targetW);
+  // Sonar safety check — each robot updates its own flag, then checks ALL flags
+  bool blocked = applySonarSafety(targetV, targetW);
+  if (blocked) {
+    // Update UI once per block event
+    static bool wasBlocked = false;
+    if (!wasBlocked) printUI();
+    wasBlocked = true;
+    myRobot->setVel(0);
+    myRobot->setRotVel(0);
+    return;
+  } else {
+    static bool wasBlocked = false;
+    wasBlocked = false;
+  }
 
   targetV = std::max(-myParams.maxLinearVel, std::min(myParams.maxLinearVel, targetV));
   targetW = std::max(-myParams.maxRotVel, std::min(myParams.maxRotVel, targetW));
@@ -571,6 +613,24 @@ void MultiAgentArrowControl::controlTask()
 
   myRobot->setVel(myLastVel);
   myRobot->setRotVel(myLastRotVel);
+
+  // Broadcast telemetry to Python visualizer
+  if (gUdpSocket >= 0) {
+    RobotStateMsg msg;
+    msg.robot_id = myId;
+    msg.reserved = 0;
+    msg.x = myRobot->getX();
+    msg.y = myRobot->getY();
+    msg.theta = myRobot->getTh();
+    msg.v = myRobot->getVel();
+    msg.w = myRobot->getRotVel();
+    for (int s = 0; s < 8; s++) {
+      ArSensorReading* r = myRobot->getSonarReading(s);
+      msg.sonar[s] = r ? r->getRange() : 5000.0;
+    }
+    sendto(gUdpSocket, &msg, sizeof(msg), 0,
+           (struct sockaddr*)&gVisualizerAddr, sizeof(gVisualizerAddr));
+  }
 }
 
 // Helper to skip unreachable robots quickly
@@ -722,6 +782,19 @@ int main(int argc, char** argv)
 
     // Suppress verbose ArRobot timeout logging (reduces "Timed out" spam)
     ArLog::setLogLevel(ArLog::Terse);
+
+    // Initialize UDP socket for broadcasting telemetry to Python visualizer
+    gUdpSocket = socket(AF_INET, SOCK_DGRAM, 0);
+    if (gUdpSocket >= 0) {
+      memset(&gVisualizerAddr, 0, sizeof(gVisualizerAddr));
+      gVisualizerAddr.sin_family = AF_INET;
+      gVisualizerAddr.sin_port = htons(50000);
+      gVisualizerAddr.sin_addr.s_addr = inet_addr("127.0.0.1");
+      ArLog::log(ArLog::Terse, "ArrowControl: UDP telemetry socket ready (port 50000)");
+    }
+
+    // Auto-launch Python 2D room mapper visualizer
+    system("python3 \"FYP codes/roomMapper2D.py\" &");
 
     MultiAgentArrowControl::printUI();
 
