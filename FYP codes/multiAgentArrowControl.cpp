@@ -24,6 +24,7 @@ static std::string gSlotNames[3] = {"record_1", "record_2", "record_3"};
 static std::string gStatusMsg = "Ready";
 #include <algorithm>
 #include <cstring>
+#include <signal.h>
 
 // Networking for TCP probe
 #include <sys/socket.h>
@@ -34,6 +35,7 @@ static std::string gStatusMsg = "Ready";
 
 class MultiAgentArrowControl;
 static std::vector<MultiAgentArrowControl*> gControllers;
+static volatile bool gShutdownRequested = false;
 
 class MultiAgentArrowControl
 {
@@ -235,7 +237,7 @@ void MultiAgentArrowControl::addKeyHandlers(ArKeyHandler* keyHandler)
   keyHandler->addKeyHandler('1', &myPlay1CB);
   keyHandler->addKeyHandler('2', &myPlay2CB);
   keyHandler->addKeyHandler('3', &myPlay3CB);
-  keyHandler->addKeyHandler('s', &mySaveCB);
+  keyHandler->addKeyHandler('n', &mySaveCB); // 'n' for Name/Save
 }
 
 void MultiAgentArrowControl::keyUp()
@@ -276,7 +278,7 @@ void MultiAgentArrowControl::keyStop()
 void MultiAgentArrowControl::keyQuit()
 {
   ArLog::log(ArLog::Normal, "ArrowControl: quit requested");
-  Aria::exit(0);
+  gShutdownRequested = true;
 }
 
 void MultiAgentArrowControl::setAllCommands(double v, double w, bool enabled, const char* label)
@@ -448,13 +450,19 @@ void MultiAgentArrowControl::printUI()
     printf("--- RECORD & PLAYBACK ---\n");
     printf("   [    R    ]  : Start/Stop sequence recording\n");
     printf("   [ 1, 2, 3 ]  : Playback recorded sequences\n");
-    printf("   [    S    ]  : Save & Rename a recording slot\n\n");
+    printf("   [    N    ]  : Save & Rename a recording slot\n\n");
     
     printf("--- LOADED RECORDINGS ---\n");
     for(int i = 0; i < 3; i++) {
         size_t len = 0;
         if (!gControllers.empty()) len = gControllers[0]->myRecords[i+1].history.size();
         printf("   Slot %d: %s (%zu frames)\n", i+1, gSlotNames[i].c_str(), len);
+    }
+    
+    printf("\n--- ROBOTS ---\n");
+    for(size_t i = 0; i < gControllers.size(); i++) {
+        bool conn = gControllers[i]->myRobot->isConnected();
+        printf("   Robot %d: %s\n", gControllers[i]->myId, conn ? "CONNECTED" : "DISCONNECTED");
     }
     
     printf("\n===================================================\n");
@@ -585,9 +593,17 @@ static bool probeTcpPort(const std::string& ip, int port)
   return (result == 0);
 }
 
+static void sigintHandler(int sig)
+{
+  (void)sig;
+  printf("\nCtrl+C received, shutting down gracefully...\n");
+  gShutdownRequested = true;
+}
+
 int main(int argc, char** argv)
 {
   Aria::init();
+  signal(SIGINT, sigintHandler); // Early registration for connection phase
 
   ArArgumentParser parser(&argc, argv);
   parser.loadDefaultArguments();
@@ -655,7 +671,7 @@ int main(int argc, char** argv)
       if (r.connector->connectRobot())
       {
         ArLog::log(ArLog::Normal, "ArrowControl: Robot %d connected! (Name: %s)", r.id, r.robot->getRobotName());
-        r.robot->setConnectionTimeoutTime(8000); // Tolerate up to 8sec of lag
+        r.robot->setConnectionTimeoutTime(15000); // Tolerate up to 15sec of WiFi lag
         r.robot->runAsync(true);
         ArUtil::sleep(500); // Wait for connection to settle
         r.control = new MultiAgentArrowControl(r.robot, r.id);
@@ -703,10 +719,18 @@ int main(int argc, char** argv)
     }
 
     ArLog::log(ArLog::Normal, "ArrowControl: %d robots connected", connectedCount);
+
+    // Suppress verbose ArRobot timeout logging (reduces "Timed out" spam)
+    ArLog::setLogLevel(ArLog::Terse);
+
     MultiAgentArrowControl::printUI();
+
+    // Register our SIGINT handler AFTER attachKeyHandler so ARIA doesn't override it
+    signal(SIGINT, sigintHandler);
 
     while (true)
     {
+      if (gShutdownRequested) break;
       bool anyConnected = false;
       for (size_t i = 0; i < robots.size(); ++i)
       {
@@ -720,21 +744,52 @@ int main(int argc, char** argv)
       ArUtil::sleep(100);
     }
 
+    printf("\nShutting down robots...\n");
+    fflush(stdout);
+
     Aria::setKeyHandler(NULL);
 
+    // Step 1: Send stop/disable commands while async threads are still running
+    // (so packet sender can actually deliver the commands to the robots)
+    for (size_t i = 0; i < robots.size(); ++i)
+    {
+      if (robots[i].robot && robots[i].robot->isConnected()) {
+        robots[i].robot->lock();
+        robots[i].robot->setVel(0);
+        robots[i].robot->setRotVel(0);
+        robots[i].robot->disableMotors();
+        robots[i].robot->disableSonar();
+        robots[i].robot->unlock();
+      }
+    }
+    ArUtil::sleep(500); // Give time for commands to be sent over WiFi
+
+    // Step 2: Stop the async threads FIRST (prevents read-after-close crashes)
     for (size_t i = 0; i < robots.size(); ++i)
     {
       if (robots[i].robot) {
-        robots[i].robot->disconnect(); // Ensure TCP closes properly
         robots[i].robot->stopRunning();
         robots[i].robot->waitForRunExit();
       }
-      if (robots[i].control) delete robots[i].control;
+    }
+
+    // Step 3: Now safe to delete controllers and disconnect
+    for (size_t i = 0; i < robots.size(); ++i)
+    {
+      if (robots[i].control) {
+        delete robots[i].control;
+        robots[i].control = NULL;
+      }
+      if (robots[i].robot) {
+        robots[i].robot->disconnect();
+      }
       if (robots[i].connector) delete robots[i].connector;
       if (robots[i].parser) delete robots[i].parser;
       if (robots[i].sonar) delete robots[i].sonar;
       if (robots[i].robot) delete robots[i].robot;
     }
+
+    printf("All robots shut down cleanly.\n");
   }
   else
   {
@@ -793,9 +848,21 @@ int main(int argc, char** argv)
     printf("SPACE or b: stop | q: quit\n\n");
     fflush(stdout);
 
-    while (robot.isConnected()) ArUtil::sleep(100);
+    while (robot.isConnected() && !gShutdownRequested) ArUtil::sleep(100);
+
+    robot.lock();
+    robot.setVel(0);
+    robot.setRotVel(0);
+    robot.disableMotors();
+    robot.disableSonar();
+    robot.unlock();
+    ArUtil::sleep(300);
+    robot.stopRunning();
+    robot.waitForRunExit();
+    robot.disconnect();
   }
 
-  Aria::exit(0);
-  return 0;
+  printf("Program exiting.\n");
+  fflush(stdout);
+  _exit(0); // Hard exit - avoids ARIA double-cleanup crash
 }
