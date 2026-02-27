@@ -565,6 +565,24 @@ bool MultiAgentArrowControl::applySonarSafety(double& targetV, double& targetW)
 
 void MultiAgentArrowControl::controlTask()
 {
+  // ALWAYS broadcast telemetry first (even when stopped/blocked)
+  if (gUdpSocket >= 0) {
+    RobotStateMsg msg;
+    msg.robot_id = myId;
+    msg.reserved = 0;
+    msg.x = myRobot->getX();
+    msg.y = myRobot->getY();
+    msg.theta = myRobot->getTh();
+    msg.v = myRobot->getVel();
+    msg.w = myRobot->getRotVel();
+    for (int s = 0; s < 8; s++) {
+      ArSensorReading* r = myRobot->getSonarReading(s);
+      msg.sonar[s] = r ? r->getRange() : 5000.0;
+    }
+    sendto(gUdpSocket, &msg, sizeof(msg), 0,
+           (struct sockaddr*)&gVisualizerAddr, sizeof(gVisualizerAddr));
+  }
+
   double targetV = myCommandEnabled ? myTargetVel : 0.0;
   double targetW = myCommandEnabled ? myTargetRotVel : 0.0;
 
@@ -613,24 +631,6 @@ void MultiAgentArrowControl::controlTask()
 
   myRobot->setVel(myLastVel);
   myRobot->setRotVel(myLastRotVel);
-
-  // Broadcast telemetry to Python visualizer
-  if (gUdpSocket >= 0) {
-    RobotStateMsg msg;
-    msg.robot_id = myId;
-    msg.reserved = 0;
-    msg.x = myRobot->getX();
-    msg.y = myRobot->getY();
-    msg.theta = myRobot->getTh();
-    msg.v = myRobot->getVel();
-    msg.w = myRobot->getRotVel();
-    for (int s = 0; s < 8; s++) {
-      ArSensorReading* r = myRobot->getSonarReading(s);
-      msg.sonar[s] = r ? r->getRange() : 5000.0;
-    }
-    sendto(gUdpSocket, &msg, sizeof(msg), 0,
-           (struct sockaddr*)&gVisualizerAddr, sizeof(gVisualizerAddr));
-  }
 }
 
 // Helper to skip unreachable robots quickly
@@ -819,6 +819,10 @@ int main(int argc, char** argv)
 
     printf("\nShutting down robots...\n");
     fflush(stdout);
+
+    // Close UDP socket and kill Python visualizer
+    if (gUdpSocket >= 0) { close(gUdpSocket); gUdpSocket = -1; }
+    system("pkill -f roomMapper2D.py 2>/dev/null");
 
     Aria::setKeyHandler(NULL);
 

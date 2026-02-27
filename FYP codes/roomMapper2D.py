@@ -24,12 +24,36 @@ MSG_FORMAT = '2i13d'
 MSG_SIZE = struct.calcsize(MSG_FORMAT)
 
 # P3DX sonar array angles (degrees relative to robot front)
-# Front 8 sonars: approximately these angles
-SONAR_ANGLES = [-90, -50, -30, -10, 10, 30, 50, 90]
+SONAR_ANGLES = [90, 50, 30, 10, -10, -30, -50, -90]
+
+# ============================================================
+# CONFIGURATION — adjust these to match your physical layout
+# ============================================================
+
+# Initial position offsets (mm) for each robot
+# Since ARIA resets all robots to (0,0), we add offsets so they
+# appear at their real-world relative positions on the map.
+# Adjust these to match how your robots are physically arranged.
+ROBOT_OFFSETS = {
+    1: (0, 0),        # Robot 1: origin (reference robot)
+    2: (600, 0),      # Robot 2: 600mm to the right of Robot 1
+    3: (-600, 0),     # Robot 3: 600mm to the left of Robot 1
+}
+
+# Robots with broken sonar — skip their obstacle data
+BROKEN_SONAR_ROBOTS = {3}  # Robot 3 sonar is broken
+
+# Obstacle detection settings
+OBSTACLE_MAX_RANGE = 300     # mm — only show obstacles that actually block the robot
+OBSTACLE_MIN_RANGE = 50      # mm — ignore readings too close (sensor noise)
+OBSTACLE_DEDUP_RADIUS = 30   # mm — skip point if one already exists within this radius
+MAX_OBSTACLE_POINTS = 8000   # Cap total stored points
+
+# ============================================================
 
 # Colors for each robot
-ROBOT_COLORS = {1: '#FF3B30', 2: '#007AFF', 3: '#34C759'}  # Red, Blue, Green
-ROBOT_NAMES = {1: 'Robot 1', 2: 'Robot 2', 3: 'Robot 3'}
+ROBOT_COLORS = {1: '#FF3B30', 2: '#007AFF', 3: '#34C759'}
+ROBOT_NAMES = {1: 'Robot 1', 2: 'Robot 2', 3: 'Robot 3 (no sonar)'}
 
 
 class RoomMapper2D:
@@ -42,21 +66,21 @@ class RoomMapper2D:
         self.robots = {}
         self.last_seen = {}
         self.trajectories = defaultdict(list)
-        self.max_trail = 500  # Keep last N path points
+        self.max_trail = 1000  # Keep more path points for full trail
 
-        # Persistent obstacle map — points accumulate over time
-        self.obstacle_points = []  # List of (x, y) tuples
-        self.max_obstacles = 5000  # Cap to prevent memory issues
+        # Persistent obstacle map — numpy array for fast dedup
+        self.obstacle_points = np.empty((0, 2), dtype=np.float64)
 
         # Setup matplotlib
         plt.style.use('dark_background')
         self.fig, self.ax = plt.subplots(1, 1, figsize=(12, 10))
         self.fig.canvas.manager.set_window_title('2D Room Mapper — Swarm Robot Controller')
 
-        # Plot elements (initialized empty)
+        # Plot elements
         self.obstacle_scatter = None
         self.robot_markers = {}
         self.robot_arrows = {}
+        self.robot_labels = {}
         self.trail_lines = {}
         self.sonar_lines = {}
         self.status_text = None
@@ -93,9 +117,24 @@ class RoomMapper2D:
         # Legend
         for rid, color in ROBOT_COLORS.items():
             self.ax.plot([], [], 'o', color=color, label=ROBOT_NAMES[rid], markersize=8)
-        self.ax.plot([], [], 's', color='#FFD60A', label='Obstacles', markersize=6, alpha=0.7)
+        self.ax.plot([], [], 's', color='#FFD60A', label='Obstacles (cleaned)', markersize=6, alpha=0.7)
         self.ax.legend(loc='upper right', fontsize=9, framealpha=0.8, 
                        facecolor='#16213e', edgecolor='#444')
+
+    def _add_obstacle_point(self, hx, hy):
+        """Add obstacle point with deduplication — skip if too close to existing point"""
+        if len(self.obstacle_points) > 0:
+            # Fast distance check against all existing points
+            dists = np.sqrt((self.obstacle_points[:, 0] - hx)**2 + 
+                            (self.obstacle_points[:, 1] - hy)**2)
+            if np.min(dists) < OBSTACLE_DEDUP_RADIUS:
+                return  # Too close to existing point, skip
+
+        self.obstacle_points = np.vstack([self.obstacle_points, [hx, hy]])
+
+        # Cap total points
+        if len(self.obstacle_points) > MAX_OBSTACLE_POINTS:
+            self.obstacle_points = self.obstacle_points[-MAX_OBSTACLE_POINTS:]
 
     def udp_listener(self):
         """Background thread: receive UDP telemetry"""
@@ -115,9 +154,14 @@ class RoomMapper2D:
                 if len(data) == MSG_SIZE:
                     unpacked = struct.unpack(MSG_FORMAT, data)
                     r_id = unpacked[0]
-                    x, y, th = unpacked[2], unpacked[3], unpacked[4]
+                    x_raw, y_raw, th = unpacked[2], unpacked[3], unpacked[4]
                     v, w = unpacked[5], unpacked[6]
                     sonars = list(unpacked[7:15])
+
+                    # Apply initial position offset
+                    ox, oy = ROBOT_OFFSETS.get(r_id, (0, 0))
+                    x = x_raw + ox
+                    y = y_raw + oy
 
                     with self.lock:
                         self.robots[r_id] = {
@@ -131,17 +175,15 @@ class RoomMapper2D:
                         if len(self.trajectories[r_id]) > self.max_trail:
                             self.trajectories[r_id] = self.trajectories[r_id][-self.max_trail:]
 
-                        # Convert sonar hits to world coordinates and add to obstacle map
-                        for i, dist in enumerate(sonars):
-                            if 50 < dist < 4500:  # Valid sonar reading
-                                angle_rad = math.radians(th + SONAR_ANGLES[i])
-                                hit_x = x + dist * math.cos(angle_rad)
-                                hit_y = y + dist * math.sin(angle_rad)
-                                self.obstacle_points.append((hit_x, hit_y))
-
-                        # Cap obstacle points
-                        if len(self.obstacle_points) > self.max_obstacles:
-                            self.obstacle_points = self.obstacle_points[-self.max_obstacles:]
+                        # Only process sonar for robots with working sonar
+                        if r_id not in BROKEN_SONAR_ROBOTS:
+                            for i, dist in enumerate(sonars):
+                                # Data cleaning: only close, valid readings
+                                if OBSTACLE_MIN_RANGE < dist < OBSTACLE_MAX_RANGE:
+                                    angle_rad = math.radians(th + SONAR_ANGLES[i])
+                                    hit_x = x + dist * math.cos(angle_rad)
+                                    hit_y = y + dist * math.sin(angle_rad)
+                                    self._add_obstacle_point(hit_x, hit_y)
 
             except socket.timeout:
                 pass
@@ -166,11 +208,10 @@ class RoomMapper2D:
                 self.obstacle_scatter.remove()
                 self.obstacle_scatter = None
 
-            if self.obstacle_points:
-                obs = np.array(self.obstacle_points)
+            if len(self.obstacle_points) > 0:
                 self.obstacle_scatter = self.ax.scatter(
-                    obs[:, 0], obs[:, 1], 
-                    c='#FFD60A', s=3, alpha=0.5, marker='s', zorder=2
+                    self.obstacle_points[:, 0], self.obstacle_points[:, 1], 
+                    c='#FFD60A', s=6, alpha=0.7, marker='s', zorder=2
                 )
                 artists.append(self.obstacle_scatter)
 
@@ -181,6 +222,9 @@ class RoomMapper2D:
             for key in list(self.robot_arrows.keys()):
                 try: self.robot_arrows[key].remove()
                 except: pass
+            for key in list(self.robot_labels.keys()):
+                try: self.robot_labels[key].remove()
+                except: pass
             for key in list(self.trail_lines.keys()):
                 try: self.trail_lines[key].remove()
                 except: pass
@@ -190,6 +234,7 @@ class RoomMapper2D:
                     except: pass
             self.robot_markers.clear()
             self.robot_arrows.clear()
+            self.robot_labels.clear()
             self.trail_lines.clear()
             self.sonar_lines.clear()
 
@@ -213,46 +258,47 @@ class RoomMapper2D:
                 self.robot_arrows[rid] = arrow
 
                 # Robot label
-                self.ax.annotate(f'R{rid}', (x, y), textcoords="offset points",
-                                 xytext=(10, 10), fontsize=8, color=color, fontweight='bold',
+                sonar_tag = "" if rid not in BROKEN_SONAR_ROBOTS else " ⚠"
+                label = self.ax.annotate(f'R{rid}{sonar_tag}', (x, y), textcoords="offset points",
+                                 xytext=(10, 10), fontsize=9, color=color, fontweight='bold',
                                  zorder=7)
+                self.robot_labels[rid] = label
 
                 # Path trail
                 trail = self.trajectories.get(rid, [])
                 if len(trail) > 1:
                     tx = [p[0] for p in trail]
                     ty = [p[1] for p in trail]
-                    line = self.ax.plot(tx, ty, '-', color=color, linewidth=1, alpha=0.4, zorder=3)[0]
+                    line = self.ax.plot(tx, ty, '-', color=color, linewidth=2.5, alpha=0.8, zorder=3)[0]
                     self.trail_lines[rid] = line
 
-                # Live sonar beams
+                # Live sonar beams (only for robots with working sonar)
                 self.sonar_lines[rid] = []
-                for i, dist in enumerate(state['sonar']):
-                    if dist > 0 and dist < 5000:
-                        angle_rad = math.radians(th + SONAR_ANGLES[i])
-                        end_x = x + dist * math.cos(angle_rad)
-                        end_y = y + dist * math.sin(angle_rad)
-                        beam_color = '#FF6B6B' if dist < 250 else '#4ECDC4'
-                        beam_alpha = 0.6 if dist < 250 else 0.2
-                        beam = self.ax.plot([x, end_x], [y, end_y], '-', 
-                                            color=beam_color, linewidth=0.8, alpha=beam_alpha, zorder=4)[0]
-                        self.sonar_lines[rid].append(beam)
+                if rid not in BROKEN_SONAR_ROBOTS:
+                    for i, dist in enumerate(state['sonar']):
+                        if dist > 0 and dist < 5000:
+                            angle_rad = math.radians(th + SONAR_ANGLES[i])
+                            end_x = x + dist * math.cos(angle_rad)
+                            end_y = y + dist * math.sin(angle_rad)
+                            beam_color = '#FF6B6B' if dist < 250 else '#4ECDC4'
+                            beam_alpha = 0.6 if dist < 250 else 0.15
+                            beam = self.ax.plot([x, end_x], [y, end_y], '-', 
+                                                color=beam_color, linewidth=0.8, alpha=beam_alpha, zorder=4)[0]
+                            self.sonar_lines[rid].append(beam)
 
             # --- Auto-scale to fit all data ---
             all_x, all_y = [], []
             for rid, state in active_robots.items():
                 all_x.append(state['x'])
                 all_y.append(state['y'])
-            if self.obstacle_points:
-                obs = np.array(self.obstacle_points)
-                all_x.extend(obs[:, 0].tolist())
-                all_y.extend(obs[:, 1].tolist())
+            if len(self.obstacle_points) > 0:
+                all_x.extend(self.obstacle_points[:, 0].tolist())
+                all_y.extend(self.obstacle_points[:, 1].tolist())
 
             if all_x and all_y:
                 margin = 1000
                 x_min, x_max = min(all_x) - margin, max(all_x) + margin
                 y_min, y_max = min(all_y) - margin, max(all_y) + margin
-                # Keep aspect ratio square
                 x_range = x_max - x_min
                 y_range = y_max - y_min
                 max_range = max(x_range, y_range, 2000)
@@ -264,21 +310,20 @@ class RoomMapper2D:
             # --- Update HUD ---
             hud = "══ ROOM MAPPER ══\n"
             hud += f"Robots: {len(active_robots)}/3\n"
-            hud += f"Obstacles: {len(self.obstacle_points)}\n"
+            hud += f"Obstacle pts: {len(self.obstacle_points)}\n"
             for rid in sorted(active_robots.keys()):
                 s = active_robots[rid]
-                hud += f"R{rid}: ({s['x']:.0f}, {s['y']:.0f}) θ={s['th']:.0f}°\n"
+                tag = " ⚠no sonar" if rid in BROKEN_SONAR_ROBOTS else ""
+                hud += f"R{rid}: ({s['x']:.0f},{s['y']:.0f}) θ{s['th']:.0f}°{tag}\n"
             self.status_text.set_text(hud)
 
         return artists
 
     def run(self):
         """Start the visualizer"""
-        # Start UDP listener
         listener = threading.Thread(target=self.udp_listener, daemon=True)
         listener.start()
 
-        # Start animation
         self.anim = FuncAnimation(self.fig, self._update_frame, interval=100, blit=False, cache_frame_data=False)
 
         try:
