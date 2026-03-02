@@ -691,9 +691,9 @@ int main(int argc, char** argv)
     };
 
     std::vector<RobotEntry> robots;
-    robots.push_back({1, "192.168.1.2", 8101, NULL, NULL, NULL, NULL, NULL});
+    robots.push_back({1, "192.168.1.4", 8103, NULL, NULL, NULL, NULL, NULL});
     robots.push_back({2, "192.168.1.3", 8102, NULL, NULL, NULL, NULL, NULL});
-    robots.push_back({3, "192.168.1.4", 8103, NULL, NULL, NULL, NULL, NULL});
+    robots.push_back({3, "192.168.1.2", 8101, NULL, NULL, NULL, NULL, NULL});
 
     int connectedCount = 0;
 

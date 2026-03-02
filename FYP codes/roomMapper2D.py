@@ -41,7 +41,7 @@ ROBOT_OFFSETS = {
 }
 
 # Robots with broken sonar — skip their obstacle data
-BROKEN_SONAR_ROBOTS = {3}  # Robot 3 sonar is broken
+BROKEN_SONAR_ROBOTS = {1}  # Robot 1 (formerly Robot 3 physical) sonar is broken
 
 # Obstacle detection settings
 OBSTACLE_MAX_RANGE = 300     # mm — only show obstacles that actually block the robot
@@ -53,7 +53,7 @@ MAX_OBSTACLE_POINTS = 8000   # Cap total stored points
 
 # Colors for each robot
 ROBOT_COLORS = {1: '#FF3B30', 2: '#007AFF', 3: '#34C759'}
-ROBOT_NAMES = {1: 'Robot 1', 2: 'Robot 2', 3: 'Robot 3 (no sonar)'}
+ROBOT_NAMES = {1: 'Robot 1 (no sonar)', 2: 'Robot 2', 3: 'Robot 3'}
 
 
 class RoomMapper2D:
