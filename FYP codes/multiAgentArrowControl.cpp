@@ -51,11 +51,14 @@ static int gCmdSocket = -1;
 
 struct RobotStateMsg {
   int robot_id;
-  int reserved;  // padding / future use
+  int boids_active;       // 1 = boids exploring, 0 = manual
   double x, y, theta;
   double v, w;
+  double battery;         // battery voltage (normalized ~12V)
   double sonar[8];
 };
+
+static volatile bool gBoidsMode = false;
 
 class MultiAgentArrowControl
 {
@@ -115,6 +118,7 @@ private:
   ArFunctorC<MultiAgentArrowControl> myPlay2CB;
   ArFunctorC<MultiAgentArrowControl> myPlay3CB;
   ArFunctorC<MultiAgentArrowControl> mySaveCB;
+  ArFunctorC<MultiAgentArrowControl> myBoidsCB;
 
   void keyRecord();
   void keyPlay(int slot);
@@ -122,6 +126,7 @@ private:
   void keyPlay2();
   void keyPlay3();
   void keySave();
+  void keyBoids();
 
   struct RecordState {
     std::vector<std::pair<double, double>> history;
@@ -191,6 +196,7 @@ MultiAgentArrowControl::MultiAgentArrowControl(ArRobot* robot, int robotId) :
   myPlay2CB(this, &MultiAgentArrowControl::keyPlay2),
   myPlay3CB(this, &MultiAgentArrowControl::keyPlay3),
   mySaveCB(this, &MultiAgentArrowControl::keySave),
+  myBoidsCB(this, &MultiAgentArrowControl::keyBoids),
   myPlayingSlot(-1),
   myPlaybackIndex(0)
 {
@@ -263,6 +269,7 @@ void MultiAgentArrowControl::addKeyHandlers(ArKeyHandler* keyHandler)
   keyHandler->addKeyHandler('2', &myPlay2CB);
   keyHandler->addKeyHandler('3', &myPlay3CB);
   keyHandler->addKeyHandler('n', &mySaveCB); // 'n' for Name/Save
+  keyHandler->addKeyHandler('e', &myBoidsCB); // 'e' for Explore (boids)
 }
 
 void MultiAgentArrowControl::keyUp()
@@ -431,6 +438,28 @@ void MultiAgentArrowControl::keySave()
   printUI();
 }
 
+void MultiAgentArrowControl::keyBoids()
+{
+  gBoidsMode = !gBoidsMode;
+  if (gBoidsMode) {
+    gStatusMsg = "BOIDS EXPLORE MODE \u2014 Robots self-driving!";
+    for (size_t i = 0; i < gControllers.size(); ++i) {
+      gControllers[i]->myCommandEnabled = false;
+      gControllers[i]->myPlayingSlot = -1;
+    }
+  } else {
+    gStatusMsg = "Manual control resumed.";
+    for (size_t i = 0; i < gControllers.size(); ++i) {
+      gControllers[i]->myTargetVel = 0;
+      gControllers[i]->myTargetRotVel = 0;
+      gControllers[i]->myCommandEnabled = false;
+      gControllers[i]->myLastVel = 0;
+      gControllers[i]->myLastRotVel = 0;
+    }
+  }
+  printUI();
+}
+
 void MultiAgentArrowControl::saveRecording(int slot, const std::string& name)
 {
   std::string filename = "Robot" + std::to_string(myId) + "_" + name + ".txt";
@@ -470,7 +499,8 @@ void MultiAgentArrowControl::printUI()
     printf("   [ T F G H ]  : Move Robot 2 and 3 in OPPOSITE directions\n");
     printf("   [ W A S D ]  : Move ALL robots together\n");
     printf("   [ SPACE/X ]  : STOP ALL robots unconditionally\n");
-    printf("   [    Q    ]  : Quit Program\n\n");
+    printf("   [    Q    ]  : Quit Program\n");
+    printf("   [    E    ]  : Toggle Boids Explore Mode\n\n");
     
     printf("--- RECORD & PLAYBACK ---\n");
     printf("   [    R    ]  : Start/Stop sequence recording\n");
@@ -493,9 +523,11 @@ void MultiAgentArrowControl::printUI()
         double rearR = gControllers[i]->myRobot->getClosestSonarRange(-179.0, -120.0);
         if (frontR <= 0) frontR = 9999;
         double rearD = std::min(rearL > 0 ? rearL : 9999.0, rearR > 0 ? rearR : 9999.0);
+        double batt = gControllers[i]->myRobot->getBatteryVoltage();
         const char* blocked = gPerRobotBlocked[gControllers[i]->myId] ? " [BLOCKED]" : "";
-        printf("   Robot %d: %s  Sonar:%d  F:%.0fmm R:%.0fmm%s\n", 
-               gControllers[i]->myId, conn ? "OK" : "DOWN", numSonar, frontR, rearD, blocked);
+        const char* battWarn = (batt > 0 && batt < 11.5) ? " [LOW BATT!]" : "";
+        printf("   Robot %d: %s  Sonar:%d  F:%.0fmm R:%.0fmm  Batt:%.1fV%s%s\n", 
+               gControllers[i]->myId, conn ? "OK" : "DOWN", numSonar, frontR, rearD, batt, blocked, battWarn);
     }
     
     printf("\n===================================================\n");
@@ -504,6 +536,8 @@ void MultiAgentArrowControl::printUI()
         printf(">> [ RECORDING ACTIVE ] >> \n");
     } else if (gPerRobotBlocked[1] || gPerRobotBlocked[2] || gPerRobotBlocked[3]) {
         printf(">> [ SONAR BLOCKED — Robot %d detected obstacle at %.0fmm ] >> \n", gBlockingRobotId, gBlockingDistance);
+    } else if (gBoidsMode) {
+        printf(">> [ BOIDS EXPLORE MODE \u2014 Self-driving ] >> \n");
     } else if (gAnyDisconnected) {
         printf(">> [ CONNECTION LOST — Robot %d disconnected, ALL STOPPED ] >> \n", gDisconnectedRobotId);
     } else {
@@ -577,12 +611,13 @@ void MultiAgentArrowControl::controlTask()
   if (gUdpSocket >= 0) {
     RobotStateMsg msg;
     msg.robot_id = myId;
-    msg.reserved = 0;
+    msg.boids_active = gBoidsMode ? 1 : 0;
     msg.x = myRobot->getX();
     msg.y = myRobot->getY();
     msg.theta = myRobot->getTh();
     msg.v = myRobot->getVel();
     msg.w = myRobot->getRotVel();
+    msg.battery = myRobot->getBatteryVoltage();
     for (int s = 0; s < 8; s++) {
       ArSensorReading* r = myRobot->getSonarReading(s);
       msg.sonar[s] = r ? r->getRange() : 5000.0;
@@ -600,6 +635,74 @@ void MultiAgentArrowControl::controlTask()
 
   double targetV = myCommandEnabled ? myTargetVel : 0.0;
   double targetW = myCommandEnabled ? myTargetRotVel : 0.0;
+
+  // === BOIDS AUTONOMOUS EXPLORATION MODE ===
+  if (gBoidsMode && !gAnyDisconnected) {
+    double boidsV = 40.0;  // Base forward speed (mm/s)
+    double boidsW = 0.0;   // Rotation (deg/s)
+
+    // 1. Obstacle avoidance from sonar
+    double frontMin = 5000.0;
+    double leftMin = 5000.0;
+    double rightMin = 5000.0;
+    for (int s = 0; s < 8; s++) {
+      ArSensorReading* r = myRobot->getSonarReading(s);
+      double d = r ? r->getRange() : 5000.0;
+      if (d <= 0) d = 5000.0;
+      double ang = r ? r->getSensorTh() : 0;
+      if (ang > -45 && ang < 45) frontMin = std::min(frontMin, d);
+      else if (ang >= 45) leftMin = std::min(leftMin, d);
+      else rightMin = std::min(rightMin, d);
+    }
+
+    if (frontMin < 400.0) {
+      // Obstacle ahead — stop and turn away
+      boidsV = 0.0;
+      boidsW = (leftMin > rightMin) ? 15.0 : -15.0;
+    } else if (frontMin < 800.0) {
+      // Obstacle approaching — slow down and start turning
+      boidsV = 25.0;
+      boidsW = (leftMin > rightMin) ? 8.0 : -8.0;
+    }
+
+    // 2. Separation — steer away from nearby robots
+    double myX = myRobot->getX();
+    double myY = myRobot->getY();
+    double myTh = myRobot->getTh();
+    double sepW = 0.0;
+    for (size_t i = 0; i < gControllers.size(); i++) {
+      if (gControllers[i]->myId == myId) continue;
+      if (!gControllers[i]->myRobot->isConnected()) continue;
+      double ox = gControllers[i]->myRobot->getX();
+      double oy = gControllers[i]->myRobot->getY();
+      double dx = ox - myX;
+      double dy = oy - myY;
+      double dist = sqrt(dx * dx + dy * dy);
+      if (dist < 600.0 && dist > 0) {
+        // Angle to the other robot relative to our heading
+        double angleToOther = atan2(dy, dx) * 180.0 / M_PI;
+        double relAngle = angleToOther - myTh;
+        // Normalize to -180..180
+        while (relAngle > 180) relAngle -= 360;
+        while (relAngle < -180) relAngle += 360;
+        // Turn away from the other robot
+        double strength = (600.0 - dist) / 600.0;
+        sepW += (relAngle > 0 ? -10.0 : 10.0) * strength;
+      }
+    }
+    boidsW += sepW;
+
+    // 3. Random wander — slight random turns to explore
+    static int wanderCounter = 0;
+    wanderCounter++;
+    if (wanderCounter % 50 == 0) { // Every ~5 seconds
+      boidsW += ((rand() % 20) - 10); // Random turn -10 to +10 deg/s
+    }
+
+    targetV = boidsV;
+    targetW = std::max(-20.0, std::min(20.0, boidsW));
+    myCommandEnabled = true; // ensure velocities are applied
+  }
 
   // Playback logic overrides manual target
   if (myPlayingSlot != -1) {
@@ -673,6 +776,7 @@ static void sigintHandler(int sig)
   (void)sig;
   printf("\nCtrl+C received, shutting down gracefully...\n");
   gShutdownRequested = true;
+  system("pkill -f roomMapper2D.py 2>/dev/null");
 }
 
 // Process remote key commands received via UDP from the Python visualizer
@@ -715,6 +819,7 @@ void processRemoteCommands()
     else if (key == "1")     c->keyPlay(1);
     else if (key == "2")     c->keyPlay(2);
     else if (key == "3")     c->keyPlay(3);
+    else if (key == "e")     c->keyBoids();
     else if (key == "q")     c->keyQuit();
   }
 }
@@ -755,6 +860,9 @@ int main(int argc, char** argv)
     robots.push_back({3, "192.168.1.2", 8101, NULL, NULL, NULL, NULL, NULL});
 
     int connectedCount = 0;
+
+    // Register SIGINT handler early so Ctrl+C during connection also cleans up
+    signal(SIGINT, sigintHandler);
 
     for (size_t i = 0; i < robots.size(); ++i)
     {
@@ -815,6 +923,7 @@ int main(int argc, char** argv)
     if (connectedCount == 0)
     {
       ArLog::log(ArLog::Terse, "ArrowControl: no robots connected");
+      system("pkill -f roomMapper2D.py 2>/dev/null");
       Aria::exit(1);
       return 1;
     }
@@ -865,7 +974,9 @@ int main(int argc, char** argv)
       ArLog::log(ArLog::Terse, "ArrowControl: UDP command listener ready (port 50001)");
     }
 
-    // Auto-launch Python 2D room mapper visualizer
+    // Auto-launch Python 2D room mapper visualizer (kill orphans first)
+    system("pkill -f roomMapper2D.py 2>/dev/null");
+    ArUtil::sleep(200);
     system("python3 \"FYP codes/roomMapper2D.py\" &");
 
     MultiAgentArrowControl::printUI();

@@ -4,7 +4,7 @@ Live 2D Room Mapper for Pioneer 3DX Swarm
 Listens on UDP Port 50000 for RobotStateMsg structs.
 Sends keyboard commands to C++ on UDP Port 50001.
 Builds a persistent obstacle map from sonar readings.
-Shows robots with directions, paths, and detected obstacles.
+Shows robots with directions, paths, warnings, and detected obstacles.
 """
 
 import socket
@@ -17,11 +17,12 @@ import matplotlib
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+from matplotlib.widgets import Button
 from matplotlib.animation import FuncAnimation
 from collections import defaultdict
 
-# C++ struct: { int robot_id, int reserved, double x, y, theta, v, w, double sonar[8] }
-MSG_FORMAT = '2i13d'
+# C++ struct: { int robot_id, int boids_active, double x,y,theta,v,w, double battery, double sonar[8] }
+MSG_FORMAT = '2i14d'
 MSG_SIZE = struct.calcsize(MSG_FORMAT)
 
 # P3DX sonar array angles (degrees relative to robot front)
@@ -43,6 +44,8 @@ OBSTACLE_MAX_RANGE = 300
 OBSTACLE_MIN_RANGE = 50
 OBSTACLE_DEDUP_RADIUS = 30
 MAX_OBSTACLE_POINTS = 8000
+
+BATTERY_LOW_THRESHOLD = 11.5   # Volts — warn below this
 
 # Network
 TELEMETRY_PORT = 50000
@@ -69,14 +72,21 @@ class RoomMapper2D:
         self.trajectories = defaultdict(list)
         self.max_trail = 1000
 
+        # Battery & status tracking
+        self.battery = {}        # {rid: voltage}
+        self.boids_active = False
+
         # Persistent obstacle map
         self.obstacle_points = np.empty((0, 2), dtype=np.float64)
+
+        # Warning state
+        self.warnings = []       # list of (message, color, expiry_time)
 
         # Last key pressed (for visual feedback)
         self.last_key_label = ""
         self.last_key_time = 0
 
-        # Setup matplotlib — two panels: control guide (left) + map (right)
+        # Setup matplotlib
         plt.style.use('dark_background')
         self.fig = plt.figure(figsize=(16, 10))
         self.fig.canvas.manager.set_window_title('2D Room Mapper — Swarm Robot Controller')
@@ -101,6 +111,7 @@ class RoomMapper2D:
         self.sonar_lines = {}
         self.status_text = None
         self.key_feedback_text = None
+        self.warning_texts = []
 
         self._setup_guide()
         self._setup_map()
@@ -109,7 +120,7 @@ class RoomMapper2D:
         self.fig.canvas.mpl_connect('key_press_event', self._on_key_press)
 
     def _setup_guide(self):
-        """Draw the control guide panel"""
+        """Draw the control guide panel with boids button"""
         ax = self.ax_guide
         ax.set_xlim(0, 1)
         ax.set_ylim(0, 1)
@@ -157,9 +168,29 @@ class RoomMapper2D:
         entry('1 / 2 / 3', 'Play slot 1, 2, 3')
         entry('N', 'Save & rename slot')
 
+        section('Autonomous', '#FF6B6B')
+        entry('E', 'Toggle Boids Explore')
+
+        # Boids button
+        self.boids_btn_ax = self.fig.add_axes([0.03, 0.03, 0.14, 0.04])
+        self.boids_btn = Button(self.boids_btn_ax, 'Boids Explore',
+                                color='#2d2d44', hovercolor='#34C759')
+        self.boids_btn.label.set_fontsize(9)
+        self.boids_btn.label.set_color('white')
+        self.boids_btn.on_clicked(self._on_boids_click)
+
         # Footer
-        ax.text(0.5, 0.02, 'Click map first\nthen press keys', ha='center', va='bottom',
+        ax.text(0.5, 0.10, 'Click map first\nthen press keys', ha='center', va='bottom',
                 fontsize=7, color='white', alpha=0.5, family='monospace', style='italic')
+
+    def _on_boids_click(self, event):
+        """Toggle boids mode via button click"""
+        try:
+            self.cmd_sock.sendto(b'e', self.cmd_addr)
+        except Exception as e:
+            print(f"Send error: {e}")
+        self.last_key_label = "E: Toggle Boids Explore"
+        self.last_key_time = time.time()
 
     def _setup_map(self):
         """Setup the main map panel"""
@@ -209,7 +240,6 @@ class RoomMapper2D:
         cmd = None
         label = None
 
-        # Map matplotlib key names to our command strings
         key_map = {
             'up': ('UP', '↑ ALL Forward'),
             'down': ('DOWN', '↓ ALL Backward'),
@@ -225,6 +255,7 @@ class RoomMapper2D:
             'h': ('h', 'H: R2&R3 Turn'),
             ' ': ('SPACE', 'STOP ALL'),
             'x': ('x', 'STOP ALL'),
+            'e': ('e', 'E: Toggle Boids Explore'),
             'r': ('r', 'R: Record'),
             '1': ('1', 'Play Slot 1'),
             '2': ('2', 'Play Slot 2'),
@@ -274,9 +305,11 @@ class RoomMapper2D:
                 if len(data) == MSG_SIZE:
                     unpacked = struct.unpack(MSG_FORMAT, data)
                     r_id = unpacked[0]
+                    boids_flag = unpacked[1]
                     x_raw, y_raw, th = unpacked[2], unpacked[3], unpacked[4]
                     v, w = unpacked[5], unpacked[6]
-                    sonars = list(unpacked[7:15])
+                    batt = unpacked[7]
+                    sonars = list(unpacked[8:16])
 
                     ox, oy = ROBOT_OFFSETS.get(r_id, (0, 0))
                     x = x_raw + ox
@@ -288,6 +321,8 @@ class RoomMapper2D:
                             'v': v, 'w': w, 'sonar': sonars
                         }
                         self.last_seen[r_id] = time.time()
+                        self.battery[r_id] = batt
+                        self.boids_active = (boids_flag == 1)
 
                         self.trajectories[r_id].append((x, y))
                         if len(self.trajectories[r_id]) > self.max_trail:
@@ -319,6 +354,23 @@ class RoomMapper2D:
             active_robots = {rid: state for rid, state in self.robots.items()
                              if now - self.last_seen.get(rid, 0) < 3.0}
 
+            # --- Build warnings list ---
+            current_warnings = []
+
+            # Connection loss warnings
+            for rid in self.robots:
+                if now - self.last_seen.get(rid, 0) > 3.0:
+                    current_warnings.append((f"⚠ Robot {rid} CONNECTION LOST!", '#FF3B30'))
+
+            # Low battery warnings
+            for rid, batt in self.battery.items():
+                if 0 < batt < BATTERY_LOW_THRESHOLD:
+                    current_warnings.append((f"🔋 Robot {rid} LOW BATTERY: {batt:.1f}V", '#FFD60A'))
+
+            # Boids mode indicator
+            if self.boids_active:
+                current_warnings.append(("🤖 BOIDS EXPLORE MODE — Self-driving", '#34C759'))
+
             # --- Draw obstacles ---
             if self.obstacle_scatter is not None:
                 self.obstacle_scatter.remove()
@@ -348,11 +400,26 @@ class RoomMapper2D:
                 for line in self.sonar_lines[key]:
                     try: line.remove()
                     except: pass
+            for wt in self.warning_texts:
+                try: wt.remove()
+                except: pass
             self.robot_markers.clear()
             self.robot_arrows.clear()
             self.robot_labels.clear()
             self.trail_lines.clear()
             self.sonar_lines.clear()
+            self.warning_texts.clear()
+
+            # --- Draw warnings at top of map ---
+            for i, (msg, color) in enumerate(current_warnings):
+                wt = self.ax.text(
+                    0.5, 0.98 - i * 0.04, msg,
+                    transform=self.ax.transAxes, fontsize=10, ha='center', va='top',
+                    color='white', fontweight='bold',
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor=color, alpha=0.9),
+                    zorder=20
+                )
+                self.warning_texts.append(wt)
 
             # --- Draw each active robot ---
             for rid, state in active_robots.items():
@@ -371,10 +438,15 @@ class RoomMapper2D:
                                          zorder=6)
                 self.robot_arrows[rid] = arrow
 
-                sonar_tag = "" if rid not in BROKEN_SONAR_ROBOTS else " ⚠"
-                label = self.ax.annotate(f'R{rid}{sonar_tag}', (x, y), textcoords="offset points",
-                                 xytext=(10, 10), fontsize=9, color=color, fontweight='bold',
-                                 zorder=7)
+                # Label with warnings
+                sonar_tag = " ⚠" if rid in BROKEN_SONAR_ROBOTS else ""
+                batt_v = self.battery.get(rid, 0)
+                batt_tag = f" {batt_v:.1f}V" if batt_v > 0 else ""
+                batt_color = '#FF3B30' if (0 < batt_v < BATTERY_LOW_THRESHOLD) else color
+                label = self.ax.annotate(f'R{rid}{sonar_tag}{batt_tag}', (x, y),
+                                         textcoords="offset points",
+                                         xytext=(10, 10), fontsize=9, color=batt_color,
+                                         fontweight='bold', zorder=7)
                 self.robot_labels[rid] = label
 
                 trail = self.trajectories.get(rid, [])
@@ -419,14 +491,25 @@ class RoomMapper2D:
                 self.ax.set_ylim(cy - max_range / 2, cy + max_range / 2)
 
             # --- Update HUD ---
-            hud = "══ ROOM MAPPER ══\n"
+            mode_str = "BOIDS EXPLORE" if self.boids_active else "MANUAL"
+            hud = f"══ ROOM MAPPER ══ [{mode_str}]\n"
             hud += f"Robots: {len(active_robots)}/3\n"
             hud += f"Obstacle pts: {len(self.obstacle_points)}\n"
             for rid in sorted(active_robots.keys()):
                 s = active_robots[rid]
                 tag = " ⚠no sonar" if rid in BROKEN_SONAR_ROBOTS else ""
-                hud += f"R{rid}: ({s['x']:.0f},{s['y']:.0f}) θ{s['th']:.0f}°{tag}\n"
+                batt = self.battery.get(rid, 0)
+                batt_str = f" {batt:.1f}V" if batt > 0 else ""
+                hud += f"R{rid}: ({s['x']:.0f},{s['y']:.0f}) θ{s['th']:.0f}°{batt_str}{tag}\n"
             self.status_text.set_text(hud)
+
+            # --- Update boids button color ---
+            if self.boids_active:
+                self.boids_btn_ax.set_facecolor('#34C759')
+                self.boids_btn.label.set_text('⏹ Stop Explore')
+            else:
+                self.boids_btn_ax.set_facecolor('#2d2d44')
+                self.boids_btn.label.set_text('🤖 Boids Explore')
 
             # --- Key feedback ---
             if now - self.last_key_time < 1.5 and self.last_key_label:
