@@ -2,6 +2,7 @@
 """
 Live 2D Room Mapper for Pioneer 3DX Swarm
 Listens on UDP Port 50000 for RobotStateMsg structs.
+Sends keyboard commands to C++ on UDP Port 50001.
 Builds a persistent obstacle map from sonar readings.
 Shows robots with directions, paths, and detected obstacles.
 """
@@ -27,54 +28,69 @@ MSG_SIZE = struct.calcsize(MSG_FORMAT)
 SONAR_ANGLES = [90, 50, 30, 10, -10, -30, -50, -90]
 
 # ============================================================
-# CONFIGURATION — adjust these to match your physical layout
+# CONFIGURATION
 # ============================================================
 
-# Initial position offsets (mm) for each robot
-# Since ARIA resets all robots to (0,0), we add offsets so they
-# appear at their real-world relative positions on the map.
-# Adjust these to match how your robots are physically arranged.
 ROBOT_OFFSETS = {
-    1: (0, 0),        # Robot 1: origin (reference robot)
-    2: (600, 0),      # Robot 2: 600mm to the right of Robot 1
-    3: (-600, 0),     # Robot 3: 600mm to the left of Robot 1
+    1: (0, 0),
+    2: (600, 0),
+    3: (-600, 0),
 }
 
-# Robots with broken sonar — skip their obstacle data
-BROKEN_SONAR_ROBOTS = {1}  # Robot 1 (formerly Robot 3 physical) sonar is broken
+BROKEN_SONAR_ROBOTS = {1}
 
-# Obstacle detection settings
-OBSTACLE_MAX_RANGE = 300     # mm — only show obstacles that actually block the robot
-OBSTACLE_MIN_RANGE = 50      # mm — ignore readings too close (sensor noise)
-OBSTACLE_DEDUP_RADIUS = 30   # mm — skip point if one already exists within this radius
-MAX_OBSTACLE_POINTS = 8000   # Cap total stored points
+OBSTACLE_MAX_RANGE = 300
+OBSTACLE_MIN_RANGE = 50
+OBSTACLE_DEDUP_RADIUS = 30
+MAX_OBSTACLE_POINTS = 8000
+
+# Network
+TELEMETRY_PORT = 50000
+COMMAND_PORT = 50001
 
 # ============================================================
 
-# Colors for each robot
 ROBOT_COLORS = {1: '#FF3B30', 2: '#007AFF', 3: '#34C759'}
 ROBOT_NAMES = {1: 'Robot 1 (no sonar)', 2: 'Robot 2', 3: 'Robot 3'}
 
 
 class RoomMapper2D:
-    def __init__(self, port=50000):
-        self.port = port
+    def __init__(self):
         self.running = True
         self.lock = threading.Lock()
+
+        # Command socket (send keys to C++)
+        self.cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.cmd_addr = ('127.0.0.1', COMMAND_PORT)
 
         # Robot state
         self.robots = {}
         self.last_seen = {}
         self.trajectories = defaultdict(list)
-        self.max_trail = 1000  # Keep more path points for full trail
+        self.max_trail = 1000
 
-        # Persistent obstacle map — numpy array for fast dedup
+        # Persistent obstacle map
         self.obstacle_points = np.empty((0, 2), dtype=np.float64)
 
-        # Setup matplotlib
+        # Last key pressed (for visual feedback)
+        self.last_key_label = ""
+        self.last_key_time = 0
+
+        # Setup matplotlib — two panels: control guide (left) + map (right)
         plt.style.use('dark_background')
-        self.fig, self.ax = plt.subplots(1, 1, figsize=(12, 10))
+        self.fig = plt.figure(figsize=(16, 10))
         self.fig.canvas.manager.set_window_title('2D Room Mapper — Swarm Robot Controller')
+
+        # Control guide panel (left, narrow)
+        self.ax_guide = self.fig.add_axes([0.01, 0.02, 0.18, 0.96])
+        self.ax_guide.set_facecolor('#16213e')
+        self.ax_guide.set_xticks([])
+        self.ax_guide.set_yticks([])
+        for spine in self.ax_guide.spines.values():
+            spine.set_color('#333')
+
+        # Map panel (right, main)
+        self.ax = self.fig.add_axes([0.22, 0.05, 0.76, 0.90])
 
         # Plot elements
         self.obstacle_scatter = None
@@ -84,55 +100,159 @@ class RoomMapper2D:
         self.trail_lines = {}
         self.sonar_lines = {}
         self.status_text = None
+        self.key_feedback_text = None
 
-        self._setup_plot()
+        self._setup_guide()
+        self._setup_map()
 
-    def _setup_plot(self):
-        """Initial plot setup"""
+        # Connect keyboard events
+        self.fig.canvas.mpl_connect('key_press_event', self._on_key_press)
+
+    def _setup_guide(self):
+        """Draw the control guide panel"""
+        ax = self.ax_guide
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+
+        # Title
+        ax.text(0.5, 0.97, 'CONTROLS', ha='center', va='top',
+                fontsize=13, fontweight='bold', color='#FFD60A', family='monospace')
+        ax.axhline(y=0.955, color='#FFD60A', alpha=0.3, linewidth=1)
+
+        y = 0.93
+        gap = 0.028
+
+        def section(title, color='#4ECDC4'):
+            nonlocal y
+            y -= gap * 0.5
+            ax.text(0.5, y, title, ha='center', va='top',
+                    fontsize=9, fontweight='bold', color=color, family='monospace')
+            y -= gap
+
+        def entry(keys, desc, color='white'):
+            nonlocal y
+            ax.text(0.08, y, keys, ha='left', va='top',
+                    fontsize=8, fontweight='bold', color='#FFD60A', family='monospace')
+            ax.text(0.08, y - gap * 0.7, desc, ha='left', va='top',
+                    fontsize=7, color=color, family='monospace', alpha=0.8)
+            y -= gap * 1.8
+
+        section('Robot 1 Only', '#FF3B30')
+        entry('Arrow Keys', 'Move Robot 1')
+
+        section('Robot 2 & 3', '#007AFF')
+        entry('T / G', 'Forward / Backward')
+        entry('F / H', 'Turn Left / Right')
+
+        section('ALL Robots', '#34C759')
+        entry('W / S', 'Forward / Backward')
+        entry('A / D', 'Turn Left / Right')
+
+        section('Control')
+        entry('SPACE / X', 'STOP ALL robots')
+        entry('Q', 'Quit program')
+
+        section('Record & Play')
+        entry('R', 'Start/Stop recording')
+        entry('1 / 2 / 3', 'Play slot 1, 2, 3')
+        entry('N', 'Save & rename slot')
+
+        # Footer
+        ax.text(0.5, 0.02, 'Click map first\nthen press keys', ha='center', va='bottom',
+                fontsize=7, color='white', alpha=0.5, family='monospace', style='italic')
+
+    def _setup_map(self):
+        """Setup the main map panel"""
         self.ax.set_facecolor('#1a1a2e')
         self.fig.set_facecolor('#0f0f1a')
 
-        self.ax.set_xlabel('X (mm)', color='white', fontsize=12)
-        self.ax.set_ylabel('Y (mm)', color='white', fontsize=12)
-        self.ax.set_title('🗺️  Live 2D Room Map — Sonar Obstacle Detection', 
-                          color='white', fontsize=14, fontweight='bold', pad=15)
+        self.ax.set_xlabel('X (mm)', color='white', fontsize=11)
+        self.ax.set_ylabel('Y (mm)', color='white', fontsize=11)
+        self.ax.set_title('Live 2D Room Map — Sonar Obstacle Detection',
+                          color='white', fontsize=13, fontweight='bold', pad=10)
 
         self.ax.set_xlim(-3000, 3000)
         self.ax.set_ylim(-3000, 3000)
         self.ax.set_aspect('equal')
         self.ax.grid(True, alpha=0.15, color='white', linestyle='--')
 
-        # Origin marker
         self.ax.plot(0, 0, '+', color='white', markersize=15, alpha=0.3)
 
-        # Status HUD
+        # Status HUD (top-left of map)
         self.status_text = self.ax.text(
-            0.02, 0.98, 'Waiting for robot data...', 
-            transform=self.ax.transAxes, fontsize=10,
+            0.01, 0.99, 'Waiting for robot data...',
+            transform=self.ax.transAxes, fontsize=9,
             verticalalignment='top', color='white',
-            bbox=dict(boxstyle='round,pad=0.5', facecolor='#16213e', alpha=0.9),
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='#16213e', alpha=0.9),
+            family='monospace'
+        )
+
+        # Key feedback (bottom-center of map)
+        self.key_feedback_text = self.ax.text(
+            0.5, 0.02, '',
+            transform=self.ax.transAxes, fontsize=11,
+            ha='center', va='bottom', color='#FFD60A', fontweight='bold',
+            bbox=dict(boxstyle='round,pad=0.3', facecolor='#16213e', alpha=0.9),
             family='monospace'
         )
 
         # Legend
         for rid, color in ROBOT_COLORS.items():
             self.ax.plot([], [], 'o', color=color, label=ROBOT_NAMES[rid], markersize=8)
-        self.ax.plot([], [], 's', color='#FFD60A', label='Obstacles (cleaned)', markersize=6, alpha=0.7)
-        self.ax.legend(loc='upper right', fontsize=9, framealpha=0.8, 
+        self.ax.plot([], [], 's', color='#FFD60A', label='Obstacles', markersize=6, alpha=0.7)
+        self.ax.legend(loc='upper right', fontsize=8, framealpha=0.8,
                        facecolor='#16213e', edgecolor='#444')
 
+    def _on_key_press(self, event):
+        """Handle keyboard events from matplotlib window"""
+        key = event.key
+        cmd = None
+        label = None
+
+        # Map matplotlib key names to our command strings
+        key_map = {
+            'up': ('UP', '↑ ALL Forward'),
+            'down': ('DOWN', '↓ ALL Backward'),
+            'left': ('LEFT', '← ALL Turn Left'),
+            'right': ('RIGHT', '→ ALL Turn Right'),
+            'w': ('w', 'W: ALL Forward'),
+            's': ('s', 'S: ALL Backward'),
+            'a': ('a', 'A: ALL Turn Left'),
+            'd': ('d', 'D: ALL Turn Right'),
+            't': ('t', 'T: R2&R3 Fwd/Bwd'),
+            'g': ('g', 'G: R2&R3 Bwd/Fwd'),
+            'f': ('f', 'F: R2&R3 Turn'),
+            'h': ('h', 'H: R2&R3 Turn'),
+            ' ': ('SPACE', 'STOP ALL'),
+            'x': ('x', 'STOP ALL'),
+            'r': ('r', 'R: Record'),
+            '1': ('1', 'Play Slot 1'),
+            '2': ('2', 'Play Slot 2'),
+            '3': ('3', 'Play Slot 3'),
+            'n': ('n', 'N: Save Recording'),
+            'q': ('q', 'Q: Quit'),
+        }
+
+        if key in key_map:
+            cmd, label = key_map[key]
+            try:
+                self.cmd_sock.sendto(cmd.encode(), self.cmd_addr)
+            except Exception as e:
+                print(f"Send error: {e}")
+
+            self.last_key_label = label
+            self.last_key_time = time.time()
+
     def _add_obstacle_point(self, hx, hy):
-        """Add obstacle point with deduplication — skip if too close to existing point"""
+        """Add obstacle point with deduplication"""
         if len(self.obstacle_points) > 0:
-            # Fast distance check against all existing points
-            dists = np.sqrt((self.obstacle_points[:, 0] - hx)**2 + 
+            dists = np.sqrt((self.obstacle_points[:, 0] - hx)**2 +
                             (self.obstacle_points[:, 1] - hy)**2)
             if np.min(dists) < OBSTACLE_DEDUP_RADIUS:
-                return  # Too close to existing point, skip
+                return
 
         self.obstacle_points = np.vstack([self.obstacle_points, [hx, hy]])
 
-        # Cap total points
         if len(self.obstacle_points) > MAX_OBSTACLE_POINTS:
             self.obstacle_points = self.obstacle_points[-MAX_OBSTACLE_POINTS:]
 
@@ -145,8 +265,8 @@ class RoomMapper2D:
         except AttributeError:
             pass
         sock.settimeout(1.0)
-        sock.bind(('', self.port))
-        print(f"📡 Room Mapper listening on UDP port {self.port}...")
+        sock.bind(('', TELEMETRY_PORT))
+        print(f"📡 Room Mapper listening on UDP port {TELEMETRY_PORT}...")
 
         while self.running:
             try:
@@ -158,7 +278,6 @@ class RoomMapper2D:
                     v, w = unpacked[5], unpacked[6]
                     sonars = list(unpacked[7:15])
 
-                    # Apply initial position offset
                     ox, oy = ROBOT_OFFSETS.get(r_id, (0, 0))
                     x = x_raw + ox
                     y = y_raw + oy
@@ -170,15 +289,12 @@ class RoomMapper2D:
                         }
                         self.last_seen[r_id] = time.time()
 
-                        # Accumulate trajectory
                         self.trajectories[r_id].append((x, y))
                         if len(self.trajectories[r_id]) > self.max_trail:
                             self.trajectories[r_id] = self.trajectories[r_id][-self.max_trail:]
 
-                        # Only process sonar for robots with working sonar
                         if r_id not in BROKEN_SONAR_ROBOTS:
                             for i, dist in enumerate(sonars):
-                                # Data cleaning: only close, valid readings
                                 if OBSTACLE_MIN_RANGE < dist < OBSTACLE_MAX_RANGE:
                                     angle_rad = math.radians(th + SONAR_ANGLES[i])
                                     hit_x = x + dist * math.cos(angle_rad)
@@ -210,7 +326,7 @@ class RoomMapper2D:
 
             if len(self.obstacle_points) > 0:
                 self.obstacle_scatter = self.ax.scatter(
-                    self.obstacle_points[:, 0], self.obstacle_points[:, 1], 
+                    self.obstacle_points[:, 0], self.obstacle_points[:, 1],
                     c='#FFD60A', s=6, alpha=0.7, marker='s', zorder=2
                 )
                 artists.append(self.obstacle_scatter)
@@ -243,12 +359,10 @@ class RoomMapper2D:
                 x, y, th = state['x'], state['y'], state['th']
                 color = ROBOT_COLORS.get(rid, '#FFFFFF')
 
-                # Robot position marker
                 marker = self.ax.plot(x, y, 'o', color=color, markersize=12,
                                       markeredgecolor='white', markeredgewidth=1.5, zorder=5)[0]
                 self.robot_markers[rid] = marker
 
-                # Direction arrow
                 arrow_len = 300
                 dx = arrow_len * math.cos(math.radians(th))
                 dy = arrow_len * math.sin(math.radians(th))
@@ -257,14 +371,12 @@ class RoomMapper2D:
                                          zorder=6)
                 self.robot_arrows[rid] = arrow
 
-                # Robot label
                 sonar_tag = "" if rid not in BROKEN_SONAR_ROBOTS else " ⚠"
                 label = self.ax.annotate(f'R{rid}{sonar_tag}', (x, y), textcoords="offset points",
                                  xytext=(10, 10), fontsize=9, color=color, fontweight='bold',
                                  zorder=7)
                 self.robot_labels[rid] = label
 
-                # Path trail
                 trail = self.trajectories.get(rid, [])
                 if len(trail) > 1:
                     tx = [p[0] for p in trail]
@@ -272,7 +384,6 @@ class RoomMapper2D:
                     line = self.ax.plot(tx, ty, '-', color=color, linewidth=2.5, alpha=0.8, zorder=3)[0]
                     self.trail_lines[rid] = line
 
-                # Live sonar beams (only for robots with working sonar)
                 self.sonar_lines[rid] = []
                 if rid not in BROKEN_SONAR_ROBOTS:
                     for i, dist in enumerate(state['sonar']):
@@ -282,11 +393,11 @@ class RoomMapper2D:
                             end_y = y + dist * math.sin(angle_rad)
                             beam_color = '#FF6B6B' if dist < 250 else '#4ECDC4'
                             beam_alpha = 0.6 if dist < 250 else 0.15
-                            beam = self.ax.plot([x, end_x], [y, end_y], '-', 
+                            beam = self.ax.plot([x, end_x], [y, end_y], '-',
                                                 color=beam_color, linewidth=0.8, alpha=beam_alpha, zorder=4)[0]
                             self.sonar_lines[rid].append(beam)
 
-            # --- Auto-scale to fit all data ---
+            # --- Auto-scale ---
             all_x, all_y = [], []
             for rid, state in active_robots.items():
                 all_x.append(state['x'])
@@ -317,6 +428,13 @@ class RoomMapper2D:
                 hud += f"R{rid}: ({s['x']:.0f},{s['y']:.0f}) θ{s['th']:.0f}°{tag}\n"
             self.status_text.set_text(hud)
 
+            # --- Key feedback ---
+            if now - self.last_key_time < 1.5 and self.last_key_label:
+                self.key_feedback_text.set_text(f">> {self.last_key_label}")
+                self.key_feedback_text.set_alpha(1.0)
+            else:
+                self.key_feedback_text.set_alpha(0.0)
+
         return artists
 
     def run(self):
@@ -332,6 +450,7 @@ class RoomMapper2D:
             pass
         finally:
             self.running = False
+            self.cmd_sock.close()
             print("Room Mapper closed.")
 
 

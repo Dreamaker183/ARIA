@@ -39,10 +39,15 @@ static double gBlockingDistance = 0.0;
 class MultiAgentArrowControl;
 static std::vector<MultiAgentArrowControl*> gControllers;
 static volatile bool gShutdownRequested = false;
+static volatile bool gAnyDisconnected = false;
+static volatile int gDisconnectedRobotId = 0;
 
 // UDP telemetry broadcast for 2D map visualizer
 static int gUdpSocket = -1;
 static struct sockaddr_in gVisualizerAddr;
+
+// UDP command listener (receive key presses from Python visualizer)
+static int gCmdSocket = -1;
 
 struct RobotStateMsg {
   int robot_id;
@@ -54,6 +59,7 @@ struct RobotStateMsg {
 
 class MultiAgentArrowControl
 {
+  friend void processRemoteCommands();
 public:
   MultiAgentArrowControl(ArRobot* robot, int robotId);
   ~MultiAgentArrowControl();
@@ -498,6 +504,8 @@ void MultiAgentArrowControl::printUI()
         printf(">> [ RECORDING ACTIVE ] >> \n");
     } else if (gPerRobotBlocked[1] || gPerRobotBlocked[2] || gPerRobotBlocked[3]) {
         printf(">> [ SONAR BLOCKED — Robot %d detected obstacle at %.0fmm ] >> \n", gBlockingRobotId, gBlockingDistance);
+    } else if (gAnyDisconnected) {
+        printf(">> [ CONNECTION LOST — Robot %d disconnected, ALL STOPPED ] >> \n", gDisconnectedRobotId);
     } else {
         printf("\n");
     }
@@ -583,6 +591,13 @@ void MultiAgentArrowControl::controlTask()
            (struct sockaddr*)&gVisualizerAddr, sizeof(gVisualizerAddr));
   }
 
+  // Safety gate: stop all robots if any robot lost connection
+  if (gAnyDisconnected) {
+    myRobot->setVel(0);
+    myRobot->setRotVel(0);
+    return;
+  }
+
   double targetV = myCommandEnabled ? myTargetVel : 0.0;
   double targetW = myCommandEnabled ? myTargetRotVel : 0.0;
 
@@ -660,6 +675,50 @@ static void sigintHandler(int sig)
   gShutdownRequested = true;
 }
 
+// Process remote key commands received via UDP from the Python visualizer
+void processRemoteCommands()
+{
+  if (gCmdSocket < 0 || gControllers.empty()) return;
+
+  char buf[16];
+  struct sockaddr_in sender;
+  socklen_t slen = sizeof(sender);
+
+  while (true) {
+    ssize_t n = recvfrom(gCmdSocket, buf, sizeof(buf) - 1, 0,
+                         (struct sockaddr*)&sender, &slen);
+    if (n <= 0) break;
+    buf[n] = '\0';
+    std::string key(buf);
+
+    MultiAgentArrowControl* c = gControllers[0];
+
+    if (key == "UP")         c->keyUp();
+    else if (key == "DOWN")  c->keyDown();
+    else if (key == "LEFT")  c->keyLeft();
+    else if (key == "RIGHT") c->keyRight();
+    else if (key == "w")     c->keyUp();
+    else if (key == "s")     c->keyDown();
+    else if (key == "a")     c->keyLeft();
+    else if (key == "d")     c->keyRight();
+    else if (key == "t")     c->keyInvUp();
+    else if (key == "g")     c->keyInvDown();
+    else if (key == "f")     c->keyInvLeft();
+    else if (key == "h")     c->keyInvRight();
+    else if (key == "SPACE") c->keyStop();
+    else if (key == "x")     c->keyStop();
+    else if (key == "IUP")   c->keyIndUp();
+    else if (key == "IDOWN") c->keyIndDown();
+    else if (key == "ILEFT") c->keyIndLeft();
+    else if (key == "IRIGHT")c->keyIndRight();
+    else if (key == "r")     c->keyRecord();
+    else if (key == "1")     c->keyPlay(1);
+    else if (key == "2")     c->keyPlay(2);
+    else if (key == "3")     c->keyPlay(3);
+    else if (key == "q")     c->keyQuit();
+  }
+}
+
 int main(int argc, char** argv)
 {
   Aria::init();
@@ -731,7 +790,7 @@ int main(int argc, char** argv)
       if (r.connector->connectRobot())
       {
         ArLog::log(ArLog::Normal, "ArrowControl: Robot %d connected! (Name: %s)", r.id, r.robot->getRobotName());
-        r.robot->setConnectionTimeoutTime(15000); // Tolerate up to 15sec of WiFi lag
+        r.robot->setConnectionTimeoutTime(30000); // Tolerate up to 30sec of WiFi lag
         r.robot->runAsync(true);
         ArUtil::sleep(500); // Wait for connection to settle
         r.control = new MultiAgentArrowControl(r.robot, r.id);
@@ -793,6 +852,19 @@ int main(int argc, char** argv)
       ArLog::log(ArLog::Terse, "ArrowControl: UDP telemetry socket ready (port 50000)");
     }
 
+    // Initialize UDP command listener (receive keys from Python visualizer)
+    gCmdSocket = socket(AF_INET, SOCK_DGRAM, 0);
+    if (gCmdSocket >= 0) {
+      struct sockaddr_in cmdAddr;
+      memset(&cmdAddr, 0, sizeof(cmdAddr));
+      cmdAddr.sin_family = AF_INET;
+      cmdAddr.sin_port = htons(50001);
+      cmdAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+      bind(gCmdSocket, (struct sockaddr*)&cmdAddr, sizeof(cmdAddr));
+      fcntl(gCmdSocket, F_SETFL, O_NONBLOCK); // Non-blocking reads
+      ArLog::log(ArLog::Terse, "ArrowControl: UDP command listener ready (port 50001)");
+    }
+
     // Auto-launch Python 2D room mapper visualizer
     system("python3 \"FYP codes/roomMapper2D.py\" &");
 
@@ -804,24 +876,130 @@ int main(int argc, char** argv)
     while (true)
     {
       if (gShutdownRequested) break;
+
+      // Process any remote commands from Python visualizer
+      processRemoteCommands();
+
+      // --- Connection watchdog ---
       bool anyConnected = false;
       for (size_t i = 0; i < robots.size(); ++i)
       {
         if (robots[i].robot && robots[i].robot->isConnected())
         {
           anyConnected = true;
-          break;
+        }
+        else if (robots[i].robot && robots[i].control && !gAnyDisconnected)
+        {
+          // This robot WAS connected but lost connection
+          gAnyDisconnected = true;
+          gDisconnectedRobotId = robots[i].id;
+          gStatusMsg = "CONNECTION LOST — Reconnecting...";
+          ArLog::log(ArLog::Terse, "ArrowControl: Robot %d DISCONNECTED!", robots[i].id);
+              MultiAgentArrowControl::printUI();
         }
       }
-      if (!anyConnected) break;
+      if (!anyConnected && !gAnyDisconnected) break;
+
+      // --- Auto-reconnect loop ---
+      if (gAnyDisconnected && !gShutdownRequested)
+      {
+        // Find the disconnected robot
+        for (size_t i = 0; i < robots.size(); ++i)
+        {
+          if (robots[i].robot && !robots[i].robot->isConnected() && robots[i].control)
+          {
+            ArLog::log(ArLog::Terse, "ArrowControl: Attempting reconnect Robot %d at %s:%d...",
+                       robots[i].id, robots[i].ip.c_str(), robots[i].port);
+
+            // Wait 5 seconds before retry
+            for (int w = 0; w < 50 && !gShutdownRequested; w++) ArUtil::sleep(100);
+            if (gShutdownRequested) break;
+
+            // Probe TCP first
+            if (!probeTcpPort(robots[i].ip, robots[i].port))
+            {
+              ArLog::log(ArLog::Terse, "ArrowControl: Robot %d not reachable yet, will retry...", robots[i].id);
+              continue;
+            }
+
+            // Clean up old objects
+            robots[i].robot->stopRunning();
+            robots[i].robot->waitForRunExit();
+            robots[i].robot->disconnect();
+
+            // Remove old controller from gControllers
+            for (size_t c = 0; c < gControllers.size(); c++) {
+              if (gControllers[c] == robots[i].control) {
+                gControllers.erase(gControllers.begin() + c);
+                break;
+              }
+            }
+            delete robots[i].control;
+            delete robots[i].connector;
+            delete robots[i].parser;
+            delete robots[i].sonar;
+            delete robots[i].robot;
+
+            // Create fresh objects
+            robots[i].robot = new ArRobot();
+            robots[i].sonar = new ArSonarDevice();
+            robots[i].robot->addRangeDevice(robots[i].sonar);
+
+            std::string portStr = std::to_string(robots[i].port);
+            int* wargc = new int(5);
+            char** wargv = new char*[5];
+            wargv[0] = argv[0];
+            wargv[1] = (char*)"-remoteHost";
+            wargv[2] = strdup(robots[i].ip.c_str());
+            wargv[3] = (char*)"-remoteRobotTcpPort";
+            wargv[4] = strdup(portStr.c_str());
+
+            robots[i].parser = new ArArgumentParser(wargc, wargv);
+            robots[i].parser->loadDefaultArguments();
+            robots[i].connector = new ArRobotConnector(robots[i].parser, robots[i].robot);
+
+            if (robots[i].connector->connectRobot())
+            {
+              ArLog::log(ArLog::Terse, "ArrowControl: Robot %d RECONNECTED! (Name: %s)",
+                         robots[i].id, robots[i].robot->getRobotName());
+              robots[i].robot->setConnectionTimeoutTime(30000);
+              robots[i].robot->runAsync(true);
+              ArUtil::sleep(500);
+              robots[i].control = new MultiAgentArrowControl(robots[i].robot, robots[i].id);
+              robots[i].control->run();
+
+              gAnyDisconnected = false;
+              gDisconnectedRobotId = 0;
+              gStatusMsg = "Robot reconnected! Resuming...";
+              ArLog::setLogLevel(ArLog::Terse);
+                  MultiAgentArrowControl::printUI();
+            }
+            else
+            {
+              ArLog::log(ArLog::Terse, "ArrowControl: Robot %d reconnect FAILED, will retry...", robots[i].id);
+              delete robots[i].connector;
+              delete robots[i].parser;
+              delete robots[i].sonar;
+              delete robots[i].robot;
+              robots[i].connector = NULL;
+              robots[i].parser = NULL;
+              robots[i].sonar = NULL;
+              robots[i].robot = NULL;
+              robots[i].control = NULL;
+            }
+          }
+        }
+      }
+
       ArUtil::sleep(100);
     }
 
     printf("\nShutting down robots...\n");
     fflush(stdout);
 
-    // Close UDP socket and kill Python visualizer
+    // Close UDP sockets and kill Python visualizer
     if (gUdpSocket >= 0) { close(gUdpSocket); gUdpSocket = -1; }
+    if (gCmdSocket >= 0) { close(gCmdSocket); gCmdSocket = -1; }
     system("pkill -f roomMapper2D.py 2>/dev/null");
 
     Aria::setKeyHandler(NULL);
