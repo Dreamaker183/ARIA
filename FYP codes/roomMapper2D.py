@@ -40,10 +40,11 @@ ROBOT_OFFSETS = {
 
 BROKEN_SONAR_ROBOTS = {1}
 
-OBSTACLE_MAX_RANGE = 300
+OBSTACLE_MAX_RANGE = 500
 OBSTACLE_MIN_RANGE = 50
 OBSTACLE_DEDUP_RADIUS = 30
 MAX_OBSTACLE_POINTS = 8000
+ROBOT_FILTER_RADIUS = 400     # Ignore sonar hits within this range of a known robot
 
 BATTERY_LOW_THRESHOLD = 11.5
 
@@ -92,6 +93,14 @@ class RoomMapper2D:
         # Battery & status tracking
         self.battery = {}        # {rid: voltage}
         self.boids_active = False
+
+        # Waypoint state (Point-and-click navigation)
+        self.wp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.wp_addr = ('127.0.0.1', 50002)
+        self.waypoints = {}       # {rid: (x, y)}
+        self.waypoint_markers = {} # drawing 'X'
+        self.waypoint_lines = {}   # drawing dashed line
+        self.active_drag_robot = None
 
         # Persistent obstacle map
         self.obstacle_points = np.empty((0, 2), dtype=np.float64)
@@ -145,8 +154,10 @@ class RoomMapper2D:
         self._setup_guide()
         self._setup_map()
 
-        # Connect keyboard events
+        # Connect keyboard and mouse events
         self.fig.canvas.mpl_connect('key_press_event', self._on_key_press)
+        self.fig.canvas.mpl_connect('button_press_event', self._on_mouse_press)
+        self.fig.canvas.mpl_connect('button_release_event', self._on_mouse_release)
 
     def _setup_guide(self):
         """Draw the control guide panel with boids button"""
@@ -295,8 +306,70 @@ class RoomMapper2D:
             except Exception:
                 pass
 
+            if key in [' ', 'x']:
+                with self.lock:
+                    self.waypoints.clear()
+
             self.last_key_label = f"{label}"
             self.last_key_time = time.time()
+
+    def _on_mouse_press(self, event):
+        if event.inaxes != self.ax or event.button != 1: return
+        click_x, click_y = event.xdata, event.ydata
+        closest_rid = None
+        min_dist = float('inf')
+        
+        with self.lock:
+            for rid, state in self.robots.items():
+                if time.time() - self.last_seen.get(rid, 0) < 3.0:
+                    dist = math.hypot(state['x'] - click_x, state['y'] - click_y)
+                    if dist < 450: # Click radius (a bit larger than robot chassis)
+                        if dist < min_dist:
+                            min_dist = dist
+                            closest_rid = rid
+                            
+        self.active_drag_robot = closest_rid if closest_rid else 0
+        self.last_key_label = f"Targeting Unit {closest_rid}..." if closest_rid else "Targeting Swarm..."
+        self.last_key_time = time.time()
+
+    def _on_mouse_release(self, event):
+        if event.inaxes != self.ax or event.button != 1: 
+            self.active_drag_robot = None
+            return
+            
+        target_x, target_y = event.xdata, event.ydata
+        rid = self.active_drag_robot
+        
+        if rid is not None:
+            try:
+                # struct RobotWaypointMsg { int robot_id; double target_x; double target_y; }
+                # We must subtract ROBOT_OFFSETS because C++ uses raw odometry
+                if rid == 0:
+                    # For swarm target, send each robot separately with its own offset correction
+                    for i in range(1, 4):
+                        ox, oy = ROBOT_OFFSETS.get(i, (0, 0))
+                        wp_msg = struct.pack('1i2d', i, target_x - ox, target_y - oy)
+                        self.wp_sock.sendto(wp_msg, self.wp_addr)
+                else:
+                    ox, oy = ROBOT_OFFSETS.get(rid, (0, 0))
+                    wp_msg = struct.pack('1i2d', rid, target_x - ox, target_y - oy)
+                    self.wp_sock.sendto(wp_msg, self.wp_addr)
+                
+                with self.lock:
+                    if rid == 0:
+                        self.last_key_label = "Swarm Destination Set"
+                        for i in range(1, 4):
+                            self.waypoints[i] = (target_x, target_y)
+                    else:
+                        self.last_key_label = f"Unit {rid} Destination Set"
+                        self.waypoints[rid] = (target_x, target_y)
+                        
+                    self.boids_active = False # Manual waypoints override boids
+                    self.last_key_time = time.time()
+            except Exception:
+                pass
+                
+        self.active_drag_robot = None
 
     def _add_obstacle_point(self, hx, hy):
         """Add obstacle point with deduplication"""
@@ -358,7 +431,41 @@ class RoomMapper2D:
                                     angle_rad = math.radians(th + SONAR_ANGLES[i])
                                     hit_x = x + dist * math.cos(angle_rad)
                                     hit_y = y + dist * math.sin(angle_rad)
-                                    self._add_obstacle_point(hit_x, hit_y)
+                                    
+                                    # Filter out hits that are near another known robot
+                                    is_robot = False
+                                    for other_rid, other_state in self.robots.items():
+                                        if other_rid == r_id:
+                                            continue
+                                        if time.time() - self.last_seen.get(other_rid, 0) < 3.0:
+                                            d = math.hypot(hit_x - other_state['x'], hit_y - other_state['y'])
+                                            if d < ROBOT_FILTER_RADIUS:
+                                                is_robot = True
+                                                # Use this detection to refine relative offset
+                                                # Measured distance between robot centers
+                                                measured_dist = math.hypot(x - other_state['x'], y - other_state['y'])
+                                                # Expected raw distance from odometry
+                                                raw_x = x - ROBOT_OFFSETS.get(r_id, (0,0))[0]
+                                                raw_y = y - ROBOT_OFFSETS.get(r_id, (0,0))[1]
+                                                other_raw_x = other_state['x'] - ROBOT_OFFSETS.get(other_rid, (0,0))[0]
+                                                other_raw_y = other_state['y'] - ROBOT_OFFSETS.get(other_rid, (0,0))[1]
+                                                raw_dist = math.hypot(raw_x - other_raw_x, raw_y - other_raw_y)
+                                                # Smooth correction: nudge offset toward measured sonar distance
+                                                if raw_dist > 10:
+                                                    correction = 0.05  # gentle filter
+                                                    dx_off = other_state['x'] - x
+                                                    real_dx = dist * math.cos(angle_rad)
+                                                    # Only refine if detection seems consistent
+                                                    if abs(dist - measured_dist) < 300:
+                                                        cur_ox, cur_oy = ROBOT_OFFSETS.get(other_rid, (0, 0))
+                                                        ROBOT_OFFSETS[other_rid] = (
+                                                            cur_ox * (1-correction) + cur_ox * correction,
+                                                            cur_oy * (1-correction) + cur_oy * correction,
+                                                        )
+                                                break
+                                    
+                                    if not is_robot:
+                                        self._add_obstacle_point(hit_x, hit_y)
 
             except socket.timeout:
                 pass
@@ -399,14 +506,20 @@ class RoomMapper2D:
                 # Soft minimalist dots for the environment map (like a LiDAR scan)
                 self.obstacle_scatter = self.ax.scatter(
                     self.obstacle_points[:, 0], self.obstacle_points[:, 1],
-                    c=OBSTACLE_COLOR, s=3, alpha=0.3, edgecolors='none', zorder=2
+                    c=OBSTACLE_COLOR, s=10, alpha=0.6, edgecolors='none', zorder=2
                 )
                 artists.append(self.obstacle_scatter)
 
             # --- Clear old robot elements ---
             for key in list(self.robot_markers.keys()):
-                try: self.robot_markers[key].remove()
-                except: pass
+                patches_list = self.robot_markers[key]
+                if isinstance(patches_list, list):
+                    for p in patches_list:
+                        try: p.remove()
+                        except: pass
+                else:
+                    try: patches_list.remove()
+                    except: pass
             for dict_group in [self.robot_arrows, self.robot_labels, self.trail_lines]:
                 for key in list(dict_group.keys()):
                     try: dict_group[key].remove()
@@ -425,6 +538,34 @@ class RoomMapper2D:
             self.trail_lines.clear()
             self.sonar_lines.clear()
             self.warning_texts.clear()
+
+            # --- Clear waypoints ---
+            for key in list(self.waypoint_markers.keys()):
+                try: self.waypoint_markers[key].remove()
+                except: pass
+            for key in list(self.waypoint_lines.keys()):
+                try: self.waypoint_lines[key].remove()
+                except: pass
+            self.waypoint_markers.clear()
+            self.waypoint_lines.clear()
+
+            # --- Draw waypoints ---
+            for rid, (wx, wy) in list(self.waypoints.items()):
+                if rid in active_robots:
+                    color = ROBOT_COLORS.get(rid, TEXT_MAIN)
+                    rx, ry = active_robots[rid]['x'], active_robots[rid]['y']
+                    
+                    dist = math.hypot(wx - rx, wy - ry)
+                    if dist > 150:
+                        # Target 'X' crosshair
+                        marker = self.ax.plot(wx, wy, 'x', color=color, markersize=14, markeredgewidth=2, alpha=0.9, zorder=5)[0]
+                        self.waypoint_markers[rid] = marker
+                        
+                        # Dashed trajectory line
+                        line = self.ax.plot([rx, wx], [ry, wy], '--', color=color, linewidth=1.5, alpha=0.5, zorder=3)[0]
+                        self.waypoint_lines[rid] = line
+                    else:
+                        del self.waypoints[rid]
 
             # --- Draw warnings at top of map (Apple notification style) ---
             for i, (msg, color) in enumerate(current_warnings):
@@ -591,6 +732,7 @@ class RoomMapper2D:
         finally:
             self.running = False
             self.cmd_sock.close()
+            self.wp_sock.close()
             print("System Offline.")
 
 

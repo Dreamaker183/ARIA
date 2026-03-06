@@ -58,6 +58,20 @@ struct RobotStateMsg {
   double sonar[8];
 };
 
+struct RobotWaypointMsg {
+  int robot_id; // 0 for all, 1/2/3 for specific
+  double target_x;
+  double target_y;
+};
+
+// Target waypoints
+static double gTargetX[4] = {0.0, 0.0, 0.0, 0.0};
+static double gTargetY[4] = {0.0, 0.0, 0.0, 0.0};
+static bool gHasTarget[4] = {false, false, false, false};
+
+// UDP waypoint listener
+static int gWaypointSocket = -1;
+
 static volatile bool gBoidsMode = false;
 
 class MultiAgentArrowControl
@@ -636,6 +650,93 @@ void MultiAgentArrowControl::controlTask()
   double targetV = myCommandEnabled ? myTargetVel : 0.0;
   double targetW = myCommandEnabled ? myTargetRotVel : 0.0;
 
+  // === WAYPOINT NAVIGATION (APF) ===
+  // If we have a target point, boids mode is OFF, and we aren't disconnected
+  if (!gBoidsMode && !gAnyDisconnected && gHasTarget[myId]) {
+    double tx = gTargetX[myId];
+    double ty = gTargetY[myId];
+    double rx = myRobot->getX();
+    double ry = myRobot->getY();
+    double th = myRobot->getTh();
+    
+    double dx = tx - rx;
+    double dy = ty - ry;
+    double distToTarget = sqrt(dx*dx + dy*dy);
+    
+    if (distToTarget < 300.0) {
+      gHasTarget[myId] = false; // Reached target
+      targetV = 0.0;
+      targetW = 0.0;
+    } else {
+      // 1. Attractive force (pull to target)
+      double Fx = dx / distToTarget;
+      double Fy = dy / distToTarget;
+      
+      // 2. Repulsive force (push away from front and side sonars)
+      const double sonarAngles[8] = {90.0, 50.0, 30.0, 10.0, -10.0, -30.0, -50.0, -90.0};
+      for (int s = 0; s < 8; s++) {
+        ArSensorReading* r = myRobot->getSonarReading(s);
+        double d = r ? r->getRange() : 5000.0;
+        if (d > 0.0 && d < 1200.0) { 
+          double angle_rad = (th + sonarAngles[s]) * M_PI / 180.0;
+          double sx = rx + d * cos(angle_rad);
+          double sy = ry + d * sin(angle_rad);
+          
+          double repel_mag = 150000.0 / (d * d); // tune force intensity
+          Fx -= repel_mag * (sx - rx) / d;
+          Fy -= repel_mag * (sy - ry) / d;
+        }
+      }
+      
+      // 2b. Inter-robot repulsion (avoid collisions when converging)
+      for (size_t ci = 0; ci < gControllers.size(); ci++) {
+        MultiAgentArrowControl* other = gControllers[ci];
+        if (other->myId == myId) continue;
+        double ox = other->myRobot->getX();
+        double oy = other->myRobot->getY();
+        double interDist = sqrt((rx-ox)*(rx-ox) + (ry-oy)*(ry-oy));
+        if (interDist > 0.0 && interDist < 800.0) {
+          double repel = 200000.0 / (interDist * interDist);
+          Fx += repel * (rx - ox) / interDist;
+          Fy += repel * (ry - oy) / interDist;
+        }
+      }
+      
+      // 3. Convert resultant Force vector back to V and W
+      double target_heading = atan2(Fy, Fx) * 180.0 / M_PI;
+      double heading_diff = target_heading - th;
+      while (heading_diff > 180.0) heading_diff -= 360.0;
+      while (heading_diff < -180.0) heading_diff += 360.0;
+      
+      targetW = heading_diff * 1.5;
+      if (targetW > myParams.maxRotVel) targetW = myParams.maxRotVel;
+      if (targetW < -myParams.maxRotVel) targetW = -myParams.maxRotVel;
+      
+      // Speed proportional to distance (slow down as we approach target)
+      double speedScale = std::min(distToTarget / 600.0, 1.0);
+      
+      // If we need to turn significantly, slow down forward speed
+      if (fabs(heading_diff) > 40.0) {
+        targetV = 0.0;
+      } else {
+        targetV = myParams.maxLinearVel * speedScale * (1.0 - fabs(heading_diff)/60.0);
+        if (targetV < 15.0) targetV = 15.0; 
+      }
+      
+      // Hard safety check
+      if (applySonarSafety(targetV, targetW)) {
+        // Blocked, applySonarSafety already set targetV/W to 0
+      }
+    }
+    
+    // Apply smoothing ramp
+    myLastVel = clampDelta(targetV, myLastVel, myParams.maxVelStep);
+    myLastRotVel = clampDelta(targetW, myLastRotVel, myParams.maxRotStep);
+    myRobot->setVel(myLastVel);
+    myRobot->setRotVel(myLastRotVel);
+    return;
+  }
+
   // === BOIDS AUTONOMOUS EXPLORATION MODE ===
   if (gBoidsMode && !gAnyDisconnected) {
     double boidsV = 40.0;  // Base forward speed (mm/s)
@@ -751,14 +852,14 @@ void MultiAgentArrowControl::controlTask()
   myRobot->setRotVel(myLastRotVel);
 }
 
-// Helper to skip unreachable robots quickly
 static bool probeTcpPort(const std::string& ip, int port)
 {
   int probe = socket(AF_INET, SOCK_STREAM, 0);
   if (probe < 0) return false;
 
-  struct timeval tv = {2, 0}; // 2 second timeout
-  setsockopt(probe, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+  // Set socket to non-blocking
+  int flags = fcntl(probe, F_GETFL, 0);
+  fcntl(probe, F_SETFL, flags | O_NONBLOCK);
 
   struct sockaddr_in addr;
   memset(&addr, 0, sizeof(addr));
@@ -766,9 +867,33 @@ static bool probeTcpPort(const std::string& ip, int port)
   addr.sin_port = htons(port);
   addr.sin_addr.s_addr = inet_addr(ip.c_str());
 
-  int result = connect(probe, (struct sockaddr*)&addr, sizeof(addr));
+  // Initiate non-blocking connect
+  int res = connect(probe, (struct sockaddr*)&addr, sizeof(addr));
+  
+  if (res < 0 && errno != EINPROGRESS) {
+    ::close(probe);
+    return false;
+  }
+
+  // Use select() with 5 second timeout to wait for connection
+  fd_set fdset;
+  FD_ZERO(&fdset);
+  FD_SET(probe, &fdset);
+  struct timeval tv = {5, 0}; // 5.0 seconds
+
+  res = select(probe + 1, NULL, &fdset, NULL, &tv);
+  
+  if (res == 1) { // Socket is writable (connected)
+    int so_error;
+    socklen_t len = sizeof(so_error);
+    getsockopt(probe, SOL_SOCKET, SO_ERROR, &so_error, &len);
+    ::close(probe);
+    return (so_error == 0);
+  }
+  
+  // Timeout (res == 0) or error (res < 0)
   ::close(probe);
-  return (result == 0);
+  return false;
 }
 
 static void sigintHandler(int sig)
@@ -821,6 +946,39 @@ void processRemoteCommands()
     else if (key == "3")     c->keyPlay(3);
     else if (key == "e")     c->keyBoids();
     else if (key == "q")     c->keyQuit();
+    else if (key == "SPACE") { c->keyStop(); memset(gHasTarget, 0, sizeof(gHasTarget)); } // Also clear waypoints on space
+    else if (key == "x")     { c->keyStop(); memset(gHasTarget, 0, sizeof(gHasTarget)); }
+  }
+}
+
+// Process incoming waypoints from Python
+void processWaypoints()
+{
+  if (gWaypointSocket < 0 || gControllers.empty()) return;
+
+  struct RobotWaypointMsg wp;
+  struct sockaddr_in sender;
+  socklen_t slen = sizeof(sender);
+
+  while (true) {
+    ssize_t n = recvfrom(gWaypointSocket, &wp, sizeof(wp), 0,
+                         (struct sockaddr*)&sender, &slen);
+    if (n <= 0) break;
+    
+    // Turn off boids mode if manually sending waypoints
+    gBoidsMode = false;
+    
+    if (wp.robot_id == 0) {
+      for (int i = 1; i <= 3; i++) {
+        gTargetX[i] = wp.target_x;
+        gTargetY[i] = wp.target_y;
+        gHasTarget[i] = true;
+      }
+    } else if (wp.robot_id >= 1 && wp.robot_id <= 3) {
+      gTargetX[wp.robot_id] = wp.target_x;
+      gTargetY[wp.robot_id] = wp.target_y;
+      gHasTarget[wp.robot_id] = true;
+    }
   }
 }
 
@@ -974,6 +1132,19 @@ int main(int argc, char** argv)
       ArLog::log(ArLog::Terse, "ArrowControl: UDP command listener ready (port 50001)");
     }
 
+    // Initialize UDP waypoint listener (receive targets from Python visualizer)
+    gWaypointSocket = socket(AF_INET, SOCK_DGRAM, 0);
+    if (gWaypointSocket >= 0) {
+      struct sockaddr_in wpAddr;
+      memset(&wpAddr, 0, sizeof(wpAddr));
+      wpAddr.sin_family = AF_INET;
+      wpAddr.sin_port = htons(50002);
+      wpAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+      bind(gWaypointSocket, (struct sockaddr*)&wpAddr, sizeof(wpAddr));
+      fcntl(gWaypointSocket, F_SETFL, O_NONBLOCK); // Non-blocking reads
+      ArLog::log(ArLog::Terse, "ArrowControl: UDP waypoint listener ready (port 50002)");
+    }
+
     // Auto-launch Python 2D room mapper visualizer (kill orphans first)
     system("pkill -f roomMapper2D.py 2>/dev/null");
     ArUtil::sleep(200);
@@ -990,6 +1161,7 @@ int main(int argc, char** argv)
 
       // Process any remote commands from Python visualizer
       processRemoteCommands();
+      processWaypoints();
 
       // --- Connection watchdog ---
       bool anyConnected = false;
@@ -1111,6 +1283,7 @@ int main(int argc, char** argv)
     // Close UDP sockets and kill Python visualizer
     if (gUdpSocket >= 0) { close(gUdpSocket); gUdpSocket = -1; }
     if (gCmdSocket >= 0) { close(gCmdSocket); gCmdSocket = -1; }
+    if (gWaypointSocket >= 0) { close(gWaypointSocket); gWaypointSocket = -1; }
     system("pkill -f roomMapper2D.py 2>/dev/null");
 
     Aria::setKeyHandler(NULL);
