@@ -611,9 +611,23 @@ bool MultiAgentArrowControl::applySonarSafety(double& targetV, double& targetW)
 
   if (anyBlocked)
   {
-    targetV = 0.0;
-    targetW = 0.0;
-    return true;
+    // RELENTLESS BOIDS EXPLORE MODE:
+    // If exploring, we don't hard-stop the whole swarm. The blocked robot simply 
+    // stops moving forward but is allowed to spin to escape.
+    if (gBoidsMode) {
+        if (thisRobotBlocked) {
+            targetV = 0.0; // Stop driving into wall
+            // targetW is left alone so APF can turn the robot away
+            return true; // Return true so UI shows blocked warning
+        } else {
+            return false; // Other robots keep flying
+        }
+    } else {
+        // Normal mode: hard stop everything for safety
+        targetV = 0.0;
+        targetW = 0.0;
+        return true;
+    }
   }
 
   return false;
@@ -664,9 +678,29 @@ void MultiAgentArrowControl::controlTask()
     double distToTarget = sqrt(dx*dx + dy*dy);
     
     if (distToTarget < 300.0) {
-      gHasTarget[myId] = false; // Reached target
-      targetV = 0.0;
-      targetW = 0.0;
+      // If the target is exactly (0,0) (Return Home command), we must also align heading to 0
+      if (fabs(tx) < 1.0 && fabs(ty) < 1.0) {
+          // Normalize heading difference to [-180, 180]
+          double heading_diff = 0.0 - th;
+          while (heading_diff > 180.0) heading_diff -= 360.0;
+          while (heading_diff < -180.0) heading_diff += 360.0;
+          
+          if (fabs(heading_diff) > 5.0) {
+              // Still need to rotate
+              targetV = 0.0; // Stop moving forward
+              targetW = heading_diff > 0 ? 15.0 : -15.0; // Spin in place slowly
+          } else {
+              // Reached (0,0) and facing 0 degrees
+              gHasTarget[myId] = false; 
+              targetV = 0.0;
+              targetW = 0.0;
+          }
+      } else {
+          // Normal waypoint arrival
+          gHasTarget[myId] = false; 
+          targetV = 0.0;
+          targetW = 0.0;
+      }
     } else {
       // 1. Attractive force (pull to target)
       double Fx = dx / distToTarget;
@@ -739,13 +773,11 @@ void MultiAgentArrowControl::controlTask()
 
   // === BOIDS AUTONOMOUS EXPLORATION MODE ===
   if (gBoidsMode && !gAnyDisconnected) {
-    double boidsV = 40.0;  // Base forward speed (mm/s)
+    double boidsV = 30.0;  // Base forward speed (mm/s)
     double boidsW = 0.0;   // Rotation (deg/s)
 
-    // 1. Obstacle avoidance from sonar
-    double frontMin = 5000.0;
-    double leftMin = 5000.0;
-    double rightMin = 5000.0;
+    // 1. Obstacle avoidance from sonar (Highest priority)
+    double frontMin = 5000.0, leftMin = 5000.0, rightMin = 5000.0;
     for (int s = 0; s < 8; s++) {
       ArSensorReading* r = myRobot->getSonarReading(s);
       double d = r ? r->getRange() : 5000.0;
@@ -756,52 +788,109 @@ void MultiAgentArrowControl::controlTask()
       else rightMin = std::min(rightMin, d);
     }
 
-    if (frontMin < 400.0) {
-      // Obstacle ahead — stop and turn away
-      boidsV = 0.0;
-      boidsW = (leftMin > rightMin) ? 15.0 : -15.0;
-    } else if (frontMin < 800.0) {
-      // Obstacle approaching — slow down and start turning
+    bool obstacle_avoiding = false;
+    if (frontMin < 500.0) {
+      // Obstacle ahead — slow down significantly and turn sharply
+      boidsV = 10.0;
+      boidsW = (leftMin > rightMin) ? 20.0 : -20.0;
+      obstacle_avoiding = true;
+    } else if (frontMin < 1000.0) {
+      // Obstacle approaching — slow down slightly and start turning
       boidsV = 25.0;
-      boidsW = (leftMin > rightMin) ? 8.0 : -8.0;
+      boidsW = (leftMin > rightMin) ? 10.0 : -10.0;
+      obstacle_avoiding = true;
     }
 
-    // 2. Separation — steer away from nearby robots
-    double myX = myRobot->getX();
-    double myY = myRobot->getY();
-    double myTh = myRobot->getTh();
-    double sepW = 0.0;
-    for (size_t i = 0; i < gControllers.size(); i++) {
-      if (gControllers[i]->myId == myId) continue;
-      if (!gControllers[i]->myRobot->isConnected()) continue;
-      double ox = gControllers[i]->myRobot->getX();
-      double oy = gControllers[i]->myRobot->getY();
-      double dx = ox - myX;
-      double dy = oy - myY;
-      double dist = sqrt(dx * dx + dy * dy);
-      if (dist < 600.0 && dist > 0) {
-        // Angle to the other robot relative to our heading
-        double angleToOther = atan2(dy, dx) * 180.0 / M_PI;
-        double relAngle = angleToOther - myTh;
-        // Normalize to -180..180
-        while (relAngle > 180) relAngle -= 360;
-        while (relAngle < -180) relAngle += 360;
-        // Turn away from the other robot
-        double strength = (600.0 - dist) / 600.0;
-        sepW += (relAngle > 0 ? -10.0 : 10.0) * strength;
+    // If we're not actively dodging a wall, follow Boids rules (like fish)
+    if (!obstacle_avoiding) {
+      double myX = myRobot->getX();
+      double myY = myRobot->getY();
+      double myTh = myRobot->getTh();
+      
+      double avgX = 0, avgY = 0, avgThX = 0, avgThY = 0;
+      int neighborCount = 0;
+      
+      double sepX = 0, sepY = 0;
+      
+      // Calculate Boids vectors
+      for (size_t i = 0; i < gControllers.size(); i++) {
+        MultiAgentArrowControl* other = gControllers[i];
+        if (other->myId == myId || !other->myRobot->isConnected()) continue;
+        
+        double ox = other->myRobot->getX();
+        double oy = other->myRobot->getY();
+        double oth = other->myRobot->getTh();
+        double dist = sqrt((ox - myX)*(ox - myX) + (oy - myY)*(oy - myY));
+        
+        // Only consider neighbors within 2.5 meters
+        if (dist > 0 && dist < 2500.0) {
+          avgX += ox;
+          avgY += oy;
+          avgThX += cos(oth * M_PI / 180.0);
+          avgThY += sin(oth * M_PI / 180.0);
+          neighborCount++;
+        }
+        
+        // SEPARATION: Critical collision avoidance (< 800mm)
+        if (dist > 0 && dist < 800.0) {
+          double force = (800.0 - dist) / 800.0; // Stronger as they get closer
+          sepX -= (ox - myX) / dist * force;
+          sepY -= (oy - myY) / dist * force;
+        }
       }
-    }
-    boidsW += sepW;
-
-    // 3. Random wander — slight random turns to explore
-    static int wanderCounter = 0;
-    wanderCounter++;
-    if (wanderCounter % 50 == 0) { // Every ~5 seconds
-      boidsW += ((rand() % 20) - 10); // Random turn -10 to +10 deg/s
+      
+      double target_heading = myTh; // maintain current heading if no neighbors
+      
+      if (neighborCount > 0) {
+        // Average coordinates for COHESION
+        avgX /= neighborCount;
+        avgY /= neighborCount;
+        
+        // Cohesion force (steer to center of flock)
+        double coh_angle = atan2(avgY - myY, avgX - myX) * 180.0 / M_PI;
+        
+        // ALIGNMENT force (steer to match average heading)
+        double ali_angle = atan2(avgThY, avgThX) * 180.0 / M_PI;
+        
+        // Blend Cohesion (30%) and Alignment (70%)
+        // We use vectors to blend angles safely
+        double blendX = 0.3 * cos(coh_angle*M_PI/180.0) + 0.7 * cos(ali_angle*M_PI/180.0);
+        double blendY = 0.3 * sin(coh_angle*M_PI/180.0) + 0.7 * sin(ali_angle*M_PI/180.0);
+        
+        // Apply Separation
+        blendX += sepX * 2.0; // Separation takes strong priority over flocking
+        blendY += sepY * 2.0;
+        
+        target_heading = atan2(blendY, blendX) * 180.0 / M_PI;
+      } else {
+        // Random wander if flying solo
+        static int wanderCounter = 0;
+        wanderCounter++;
+        if (wanderCounter % 50 == 0) {
+          target_heading += ((rand() % 40) - 20); // Random turn -20 to +20 deg
+        }
+      }
+      
+      // Calculate resulting turn
+      double heading_diff = target_heading - myTh;
+      while (heading_diff > 180.0) heading_diff -= 360.0;
+      while (heading_diff < -180.0) heading_diff += 360.0;
+      
+      boidsW = heading_diff * 0.5;
+      
+      // SPEED CALCULATION
+      // Like a fish: swim faster (50-60mm/s) when going straight to catch up to the flock
+      // Swim slower (20-30mm/s) when making sharp turns to reorient
+      if (fabs(heading_diff) > 45.0) {
+        boidsV = 20.0; // Slow down for tight turns
+      } else {
+        // Linearly speed up the straighter we are going
+        boidsV = 30.0 + (30.0 * (1.0 - fabs(heading_diff)/45.0));
+      }
     }
 
     targetV = boidsV;
-    targetW = std::max(-20.0, std::min(20.0, boidsW));
+    targetW = boidsW;
     myCommandEnabled = true; // ensure velocities are applied
   }
 

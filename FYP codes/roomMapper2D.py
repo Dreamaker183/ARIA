@@ -40,7 +40,7 @@ ROBOT_OFFSETS = {
 
 BROKEN_SONAR_ROBOTS = {1}
 
-OBSTACLE_MAX_RANGE = 500
+OBSTACLE_MAX_RANGE = 2500
 OBSTACLE_MIN_RANGE = 50
 OBSTACLE_DEDUP_RADIUS = 30
 MAX_OBSTACLE_POINTS = 8000
@@ -101,9 +101,14 @@ class RoomMapper2D:
         self.waypoint_markers = {} # drawing 'X'
         self.waypoint_lines = {}   # drawing dashed line
         self.active_drag_robot = None
+        
+        # Calibration state
+        self.calibrated_robot = None
+        self.calibration_time = 0
+        self.calibration_halo = None
 
-        # Persistent obstacle map
-        self.obstacle_points = np.empty((0, 2), dtype=np.float64)
+        # Persistent obstacle map: array of [X, Y, Confidence]
+        self.obstacle_points = np.empty((0, 3), dtype=np.float64)
 
         # Warning state
         self.warnings = []       # list of (message, color, expiry_time)
@@ -216,12 +221,23 @@ class RoomMapper2D:
         self.boids_btn.label.set_color(TEXT_MAIN)
         self.boids_btn.on_clicked(self._on_boids_click)
         
+        # Home button
+        self.home_btn_ax = self.fig.add_axes([0.03, 0.02, 0.16, 0.05])
+        self.home_btn_ax.set_facecolor('#1C1C1E')
+        self.home_btn = Button(self.home_btn_ax, 'Return Home',
+                               color='#1C1C1E', hovercolor='#2C2C2E')
+        self.home_btn.label.set_fontsize(10)
+        self.home_btn.label.set_fontweight('bold')
+        self.home_btn.label.set_color(TEXT_MAIN)
+        self.home_btn.on_clicked(self._on_home_click)
+        
         # Clean button border
         for spine in self.boids_btn_ax.spines.values():
             spine.set_color('#333333')
             spine.set_linewidth(1)
-
-        # Footer
+        for spine in self.home_btn_ax.spines.values():
+            spine.set_color('#333333')
+            spine.set_linewidth(1)
         ax.text(0.5, 0.02, 'Map must have focus for inputs', ha='center', va='bottom',
                 fontsize=7, color=TEXT_MUTED)
 
@@ -233,6 +249,29 @@ class RoomMapper2D:
             pass
         self.last_key_label = "Autopilot Toggle Requested"
         self.last_key_time = time.time()
+        
+    def _on_home_click(self, event):
+        """Command all robots to return to their initial 0,0 relative origin via APF Waypoint"""
+        try:
+            for i in range(1, 4):
+                # We want the robot to reach its logical (0,0) position. 
+                # C++ expects coordinates without offsets, so (0,0) in spatial map means 
+                # the target is exactly the inverse of their offset.
+                ox, oy = ROBOT_OFFSETS.get(i, (0, 0))
+                target_x, target_y = -ox, -oy
+                
+                # Send waypoint 0,0 relative to spatial map origin (subtract offsets)
+                wp_msg = struct.pack('1i2d', i, target_x, target_y)
+                self.wp_sock.sendto(wp_msg, self.wp_addr)
+            
+            with self.lock:
+                self.last_key_label = "Return to Base Initiated"
+                for i in range(1, 4):
+                    self.waypoints[i] = (0, 0)
+                self.boids_active = False # Manual waypoints override boids
+                self.last_key_time = time.time()
+        except Exception:
+            pass
 
     def _setup_map(self):
         """Setup the main map panel"""
@@ -287,7 +326,7 @@ class RoomMapper2D:
             't': ('t', 'Split Link: Fwd/Rev'),
             'g': ('g', 'Split Link: Rev/Fwd'),
             'f': ('f', 'Split Link: CCW/CW'),
-            'h': ('h', 'Split Link: CW/CCW'),
+            'h': ('HOME', 'Return Home Base'),
             ' ': ('SPACE', 'Emergency Stop Interlock'),
             'x': ('x', 'Emergency Stop Interlock'),
             'e': ('e', 'Explore Autopilot Toggle'),
@@ -301,14 +340,21 @@ class RoomMapper2D:
 
         if key in key_map:
             cmd, label = key_map[key]
+            
+            if cmd == 'SPACE' or cmd == 'x':
+                with self.lock:
+                    self.waypoints.clear()
+            elif cmd == 'e':
+                self._on_boids_click(None)
+                return
+            elif cmd == 'HOME':
+                self._on_home_click(None)
+                return
+                
             try:
                 self.cmd_sock.sendto(cmd.encode(), self.cmd_addr)
             except Exception:
                 pass
-
-            if key in [' ', 'x']:
-                with self.lock:
-                    self.waypoints.clear()
 
             self.last_key_label = f"{label}"
             self.last_key_time = time.time()
@@ -338,51 +384,185 @@ class RoomMapper2D:
             return
             
         target_x, target_y = event.xdata, event.ydata
-        rid = self.active_drag_robot
-        
-        if rid is not None:
-            try:
-                # struct RobotWaypointMsg { int robot_id; double target_x; double target_y; }
-                # We must subtract ROBOT_OFFSETS because C++ uses raw odometry
-                if rid == 0:
-                    # For swarm target, send each robot separately with its own offset correction
-                    for i in range(1, 4):
-                        ox, oy = ROBOT_OFFSETS.get(i, (0, 0))
-                        wp_msg = struct.pack('1i2d', i, target_x - ox, target_y - oy)
-                        self.wp_sock.sendto(wp_msg, self.wp_addr)
-                else:
-                    ox, oy = ROBOT_OFFSETS.get(rid, (0, 0))
-                    wp_msg = struct.pack('1i2d', rid, target_x - ox, target_y - oy)
-                    self.wp_sock.sendto(wp_msg, self.wp_addr)
-                
-                with self.lock:
-                    if rid == 0:
-                        self.last_key_label = "Swarm Destination Set"
-                        for i in range(1, 4):
-                            self.waypoints[i] = (target_x, target_y)
-                    else:
-                        self.last_key_label = f"Unit {rid} Destination Set"
-                        self.waypoints[rid] = (target_x, target_y)
-                        
-                    self.boids_active = False # Manual waypoints override boids
-                    self.last_key_time = time.time()
-            except Exception:
-                pass
-                
+        source_rid = self.active_drag_robot
         self.active_drag_robot = None
+        
+        if source_rid is not None:
+            # Check if dropped onto another robot for Calibration
+            dropped_on_rid = None
+            if source_rid != 0:
+                with self.lock:
+                    for rid, state in self.robots.items():
+                        if rid != source_rid and time.time() - self.last_seen.get(rid, 0) < 3.0:
+                            dist = math.hypot(state['x'] - target_x, state['y'] - target_y)
+                            if dist < 450: # Dropped onto this robot
+                                dropped_on_rid = rid
+                                break
+                                
+            if dropped_on_rid is not None:
+                # Trigger Auto-Calibration
+                with self.lock:
+                    source_state = self.robots[source_rid]
+                    target_state = self.robots[dropped_on_rid]
+                    
+                    # Target robot's raw position (without offset)
+                    raw_target_x = target_state['x'] - ROBOT_OFFSETS.get(dropped_on_rid, (0, 0))[0]
+                    raw_target_y = target_state['y'] - ROBOT_OFFSETS.get(dropped_on_rid, (0, 0))[1]
+                    
+                    # Angle from Source to assumed Target position
+                    angle_to_target = math.degrees(math.atan2(target_state['y'] - source_state['y'], 
+                                                              target_state['x'] - source_state['x']))
+                    
+                    # Target physical dimensions: 38cm wide x 45cm long (380x450 mm)
+                    # We approximate the center offset distance from an edge hit based on the angle
+                    # If hitting front/back, offset is ~225mm. If hitting sides, offset is ~190mm.
+                    
+                    valid_centers_x = []
+                    valid_centers_y = []
+                    
+                    for i, dist in enumerate(source_state['sonar']):
+                        if OBSTACLE_MIN_RANGE < dist < OBSTACLE_MAX_RANGE:
+                            beam_angle = source_state['th'] + SONAR_ANGLES[i]
+                            # Normalize difference
+                            diff = (beam_angle - angle_to_target + 180) % 360 - 180
+                            
+                            # If beam is pointing generally toward the target robot
+                            if abs(diff) < 35:
+                                beam_angle_rad = math.radians(beam_angle)
+                                
+                                # Where did the sonar hit?
+                                hit_x = source_state['x'] + dist * math.cos(beam_angle_rad)
+                                hit_y = source_state['y'] + dist * math.sin(beam_angle_rad)
+                                
+                                # What is the angle of THIS hit relative to the target robot's heading?
+                                hit_angle_rel_target = (beam_angle - target_state['th'] + 180) % 360 - 180
+                                
+                                # Calculate radius from center to edge of a 380x450 rectangle at this angle
+                                a = math.radians(hit_angle_rel_target)
+                                w, h = 380.0, 450.0
+                                # Radius of bounding box at angle 'a'
+                                r_edge = min(abs(h / 2.0 / math.cos(a)) if math.cos(a) != 0 else float('inf'),
+                                             abs(w / 2.0 / math.sin(a)) if math.sin(a) != 0 else float('inf'))
+                                
+                                # The true center is r_edge distance further along the beam
+                                center_x = hit_x + r_edge * math.cos(beam_angle_rad)
+                                center_y = hit_y + r_edge * math.sin(beam_angle_rad)
+                                
+                                valid_centers_x.append(center_x)
+                                valid_centers_y.append(center_y)
+                                
+                    if len(valid_centers_x) > 0:
+                        # Average all valid sonar beams that hit the target chassis
+                        avg_target_x = sum(valid_centers_x) / len(valid_centers_x)
+                        avg_target_y = sum(valid_centers_y) / len(valid_centers_y)
+                        
+                        # Calculate the new offset required so raw_target lands exactly on avg_target
+                        new_offset_x = avg_target_x - raw_target_x
+                        new_offset_y = avg_target_y - raw_target_y
+                        
+                        ROBOT_OFFSETS[dropped_on_rid] = (new_offset_x, new_offset_y)
+                        
+                        # Immediately snap the target robot to its new true position
+                        self.robots[dropped_on_rid]['x'] = raw_target_x + new_offset_x
+                        self.robots[dropped_on_rid]['y'] = raw_target_y + new_offset_y
+                        
+                        # Clear old stale trajectory trail because it jumped
+                        self.trajectories[dropped_on_rid] = [(self.robots[dropped_on_rid]['x'], self.robots[dropped_on_rid]['y'])]
+                        
+                        # UI Feedback
+                        self.calibrated_robot = dropped_on_rid
+                        self.calibration_time = time.time()
+                        self.last_key_label = f"Unit {dropped_on_rid} Calibrated ({len(valid_centers_x)} hits)"
+                        self.last_key_time = time.time()
+                    else:
+                        self.last_key_label = f"Calibration Failed: Sonar missing"
+                        self.last_key_time = time.time()
+            else:
+                # Normal Waypoint Logic
+                try:
+                    if source_rid == 0:
+                        for i in range(1, 4):
+                            ox, oy = ROBOT_OFFSETS.get(i, (0, 0))
+                            wp_msg = struct.pack('1i2d', i, target_x - ox, target_y - oy)
+                            self.wp_sock.sendto(wp_msg, self.wp_addr)
+                    else:
+                        ox, oy = ROBOT_OFFSETS.get(source_rid, (0, 0))
+                        wp_msg = struct.pack('1i2d', source_rid, target_x - ox, target_y - oy)
+                        self.wp_sock.sendto(wp_msg, self.wp_addr)
+                    
+                    with self.lock:
+                        if source_rid == 0:
+                            self.last_key_label = "Swarm Destination Set"
+                            for i in range(1, 4):
+                                self.waypoints[i] = (target_x, target_y)
+                        else:
+                            self.last_key_label = f"Unit {source_rid} Destination Set"
+                            self.waypoints[source_rid] = (target_x, target_y)
+                            
+                        self.boids_active = False
+                        self.last_key_time = time.time()
+                except Exception:
+                    pass
 
     def _add_obstacle_point(self, hx, hy):
         """Add obstacle point with deduplication"""
         if len(self.obstacle_points) > 0:
             dists = np.sqrt((self.obstacle_points[:, 0] - hx)**2 +
                             (self.obstacle_points[:, 1] - hy)**2)
-            if np.min(dists) < OBSTACLE_DEDUP_RADIUS:
+            min_idx = np.argmin(dists)
+            if dists[min_idx] < OBSTACLE_DEDUP_RADIUS:
+                # Point already exists near here: Increase confidence to a max of 10
+                self.obstacle_points[min_idx, 2] = min(10.0, self.obstacle_points[min_idx, 2] + 1)
                 return
 
-        self.obstacle_points = np.vstack([self.obstacle_points, [hx, hy]])
+        # New point starts with Confidence = 1
+        self.obstacle_points = np.vstack([self.obstacle_points, [hx, hy, 1.0]])
 
         if len(self.obstacle_points) > MAX_OBSTACLE_POINTS:
             self.obstacle_points = self.obstacle_points[-MAX_OBSTACLE_POINTS:]
+
+    def _clear_obstacles_along_beam(self, rx, ry, clear_dist, angle_rad):
+        """Erases existing obstacle points that fall inside a newly discovered clear path."""
+        if len(self.obstacle_points) == 0:
+            return
+            
+        # Beam vector
+        dx = math.cos(angle_rad)
+        dy = math.sin(angle_rad)
+        
+        # Vector from robot to all obstacle points
+        px = self.obstacle_points[:, 0] - rx
+        py = self.obstacle_points[:, 1] - ry
+        
+        # Distance of points projected along the beam
+        proj_dist = px * dx + py * dy
+        
+        # Only care about points that are in front of the robot and within the clear distance
+        in_range_mask = (proj_dist > 0) & (proj_dist < clear_dist)
+        
+        if not np.any(in_range_mask):
+            return
+            
+        # Perpendicular distance from the actual beam line
+        perp_dist = np.abs(px * dy - py * dx)
+        
+        # We use a two-tiered clearance width depending on confidence
+        confidences = self.obstacle_points[:, 2]
+        
+        # If confidence is low (< 3, Cyan), we erase with a wide beam (width ~ 150mm)
+        # If confidence is high (>= 3, Orange), we erase only with a narrow beam (width ~ 30mm)
+        # to protect confirmed static obstacles from nearby glances.
+        max_clear_width = np.where(confidences < 3, 150.0, 30.0)
+        
+        # If the point is within range AND close to the beam line
+        clear_mask = in_range_mask & (perp_dist < max_clear_width)
+        
+        if np.any(clear_mask):
+            # Decrease confidence of cleared points
+            self.obstacle_points[clear_mask, 2] -= 1
+            
+            # Keep only points that still have confidence > 0
+            self.obstacle_points = self.obstacle_points[self.obstacle_points[:, 2] > 0]
 
     def udp_listener(self):
         """Background thread: receive UDP telemetry"""
@@ -432,6 +612,12 @@ class RoomMapper2D:
                                     hit_x = x + dist * math.cos(angle_rad)
                                     hit_y = y + dist * math.sin(angle_rad)
                                     
+                                    # --- Raycast Clearance: Erase old dots in the physically clear space ---
+                                    # This sonar beam went 'dist' far. Everything from robot to (dist - 200mm) is empty space.
+                                    clear_dist = dist - 200
+                                    if clear_dist > 0 and len(self.obstacle_points) > 0:
+                                        self._clear_obstacles_along_beam(x, y, clear_dist, angle_rad)
+                                    
                                     # Filter out hits that are near another known robot
                                     is_robot = False
                                     for other_rid, other_state in self.robots.items():
@@ -463,9 +649,14 @@ class RoomMapper2D:
                                                             cur_oy * (1-correction) + cur_oy * correction,
                                                         )
                                                 break
-                                    
                                     if not is_robot:
                                         self._add_obstacle_point(hit_x, hit_y)
+                                else:
+                                    # Even if we didn't hit an obstacle (dist is max range ~5000), 
+                                    # we still know the space up to OBSTACLE_MAX_RANGE is clear!
+                                    if dist >= OBSTACLE_MAX_RANGE:
+                                        angle_rad = math.radians(th + SONAR_ANGLES[i])
+                                        self._clear_obstacles_along_beam(x, y, OBSTACLE_MAX_RANGE, angle_rad)
 
             except socket.timeout:
                 pass
@@ -503,14 +694,22 @@ class RoomMapper2D:
                 self.obstacle_scatter = None
 
             if len(self.obstacle_points) > 0:
-                # Soft minimalist dots for the environment map (like a LiDAR scan)
+                # Create an array of colors based on confidence
+                # Confidence < 3 = unconfirmed (Cyan #00FFFF), Confidence >= 3 = static (Orange #FF9500)
+                colors = np.where(self.obstacle_points[:, 2:3] < 3, '#00FFFF', '#FF9500')
+                
                 self.obstacle_scatter = self.ax.scatter(
                     self.obstacle_points[:, 0], self.obstacle_points[:, 1],
-                    c=OBSTACLE_COLOR, s=10, alpha=0.6, edgecolors='none', zorder=2
+                    c=colors.flatten(),
+                    s=12, alpha=0.8, edgecolors='none', zorder=1
                 )
                 artists.append(self.obstacle_scatter)
 
             # --- Clear old robot elements ---
+            if self.calibration_halo is not None:
+                try: self.calibration_halo.remove()
+                except: pass
+                self.calibration_halo = None
             for key in list(self.robot_markers.keys()):
                 patches_list = self.robot_markers[key]
                 if isinstance(patches_list, list):
@@ -638,6 +837,15 @@ class RoomMapper2D:
                 self.ax.add_patch(indicator)
                 
                 self.robot_markers[rid] = [chassis, top_deck, wheel_l, wheel_r, indicator]
+                
+                # Calibration Halo
+                if rid == self.calibrated_robot and time.time() - self.calibration_time < 3.0:
+                    halo = patches.Circle((x, y), radius=350, facecolor='none', edgecolor='#FFFFAA', linewidth=4, alpha=0.9, zorder=5)
+                    self.calibration_halo = self.ax.add_patch(halo)
+                    # Add glow effect by drawing a semi-transparent slightly larger circle
+                    glow = patches.Circle((x, y), radius=380, facecolor='none', edgecolor='#FFFFAA', linewidth=8, alpha=0.3, zorder=4)
+                    self.ax.add_patch(glow)
+                    self.robot_markers[rid].extend([halo, glow])
 
                 # Apple Maps style clean elegant label
                 sonar_tag = " (Blind)" if rid in BROKEN_SONAR_ROBOTS else ""
