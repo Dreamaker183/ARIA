@@ -21,9 +21,21 @@ from matplotlib.widgets import Button
 from matplotlib.animation import FuncAnimation
 from collections import defaultdict
 
-# C++ struct: { int robot_id, int boids_active, double x,y,theta,v,w, double battery, double sonar[8] }
-MSG_FORMAT = '2i14d'
+# ============================================================
+# NETWORK CONFIGURATION
+# ============================================================
+
+TELEMETRY_PORT = 50000
+COMMAND_PORT = 50001
+WP_PORT = 50002
+# RobotStateMsg: 1 int (id), 1 int (boids_active), 2 double (x,y), 1 double (th), 2 double (v,w), 1 double (batt), 8 double (sonar)
+MSG_FORMAT = '2i2d1d2d1d8d'
 MSG_SIZE = struct.calcsize(MSG_FORMAT)
+
+# CalibrationMsg: 1 int (type=99), 1 reserved int (padding), 4 double (d2, th2, d3, th3)
+# We pad with 1 int so it aligns nicely
+CALIB_FORMAT = '2i4d'
+CALIB_SIZE = struct.calcsize(CALIB_FORMAT)
 
 # P3DX sonar array angles (degrees relative to robot front)
 SONAR_ANGLES = [90, 50, 30, 10, -10, -30, -50, -90]
@@ -251,23 +263,19 @@ class RoomMapper2D:
         self.last_key_time = time.time()
         
     def _on_home_click(self, event):
-        """Command all robots to return to their initial 0,0 relative origin via APF Waypoint"""
+        """Command all robots to return to their Global physical starting coordinates"""
         try:
             for i in range(1, 4):
-                # We want the robot to reach its logical (0,0) position. 
-                # C++ expects coordinates without offsets, so (0,0) in spatial map means 
-                # the target is exactly the inverse of their offset.
+                # Send the robot's specific physical starting offset as the global target
                 ox, oy = ROBOT_OFFSETS.get(i, (0, 0))
-                target_x, target_y = -ox, -oy
-                
-                # Send waypoint 0,0 relative to spatial map origin (subtract offsets)
-                wp_msg = struct.pack('1i2d', i, target_x, target_y)
+                wp_msg = struct.pack('1i2d', i, ox, oy)
                 self.wp_sock.sendto(wp_msg, self.wp_addr)
             
             with self.lock:
-                self.last_key_label = "Return to Base Initiated"
+                self.last_key_label = "Return to Independent Home Initiated"
                 for i in range(1, 4):
-                    self.waypoints[i] = (0, 0)
+                    ox, oy = ROBOT_OFFSETS.get(i, (0, 0))
+                    self.waypoints[i] = (ox, oy)
                 self.boids_active = False # Manual waypoints override boids
                 self.last_key_time = time.time()
         except Exception:
@@ -579,6 +587,48 @@ class RoomMapper2D:
         while self.running:
             try:
                 data, addr = sock.recvfrom(1024)
+                
+                # Check for Auto-Calibration Message
+                if len(data) == CALIB_SIZE:
+                    try:
+                        cal_data = struct.unpack(CALIB_FORMAT, data)
+                        if cal_data[0] == 99:
+                            d2, th2, d3, th3 = cal_data[2], cal_data[3], cal_data[4], cal_data[5]
+                            print(f"Received Auto-Calibration: R2 dist={d2:.0f}mm, R3 dist={d3:.0f}mm")
+                            
+                            with self.lock:
+                                # Start with base offsets for Robot 2 and 3
+                                r2_ox, r2_oy = ROBOT_OFFSETS.get(2, (600, 0))
+                                r3_ox, r3_oy = ROBOT_OFFSETS.get(3, (-600, 0))
+                                
+                                estimates = []
+                                # Estimate from Robot 2 (offsetting by robot radius ~250mm so we get center coordinates)
+                                if d2 > 0 and d2 < 4900:
+                                    r2_angle = math.radians(th2)
+                                    est_x2 = r2_ox + (d2 + 250.0) * math.cos(r2_angle)
+                                    est_y2 = r2_oy + (d2 + 250.0) * math.sin(r2_angle)
+                                    estimates.append((est_x2, est_y2))
+                                    
+                                # Estimate from Robot 3
+                                if d3 > 0 and d3 < 4900:
+                                    r3_angle = math.radians(th3)
+                                    est_x3 = r3_ox + (d3 + 250.0) * math.cos(r3_angle)
+                                    est_y3 = r3_oy + (d3 + 250.0) * math.sin(r3_angle)
+                                    estimates.append((est_x3, est_y3))
+                                    
+                                if estimates:
+                                    # Average the valid estimates
+                                    avg_x = sum(e[0] for e in estimates) / len(estimates)
+                                    avg_y = sum(e[1] for e in estimates) / len(estimates)
+                                    ROBOT_OFFSETS[1] = (avg_x, avg_y)
+                                    self.last_key_label = f"Auto-Calibrated R1: ({avg_x:.0f}, {avg_y:.0f})"
+                                    self.last_key_time = time.time()
+                            continue
+                    except Exception as e:
+                        print(f"Calibration parse error: {e}")
+                        pass
+
+                # Normal Telemetry Message
                 if len(data) == MSG_SIZE:
                     unpacked = struct.unpack(MSG_FORMAT, data)
                     r_id = unpacked[0]

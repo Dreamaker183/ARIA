@@ -58,6 +58,14 @@ struct RobotStateMsg {
   double sonar[8];
 };
 
+struct CalibrationMsg {
+  int type;      // 99 = calibration message marker
+  double d2;     // Robot 2's measured distance to Robot 1
+  double th2;    // Robot 2's heading at calibration time
+  double d3;     // Robot 3's measured distance to Robot 1  
+  double th3;    // Robot 3's heading at calibration time
+};
+
 struct RobotWaypointMsg {
   int robot_id; // 0 for all, 1/2/3 for specific
   double target_x;
@@ -68,6 +76,10 @@ struct RobotWaypointMsg {
 static double gTargetX[4] = {0.0, 0.0, 0.0, 0.0};
 static double gTargetY[4] = {0.0, 0.0, 0.0, 0.0};
 static bool gHasTarget[4] = {false, false, false, false};
+
+// Global Spatial Tracking (Physical World Coordinates)
+static double gOffsetX[4] = {0.0, 0.0, 600.0, -600.0};
+static double gOffsetY[4] = {0.0, 0.0, 0.0, 0.0};
 
 // UDP waypoint listener
 static int gWaypointSocket = -1;
@@ -727,17 +739,23 @@ void MultiAgentArrowControl::controlTask()
   if (!gBoidsMode && !gAnyDisconnected && gHasTarget[myId]) {
     double tx = gTargetX[myId];
     double ty = gTargetY[myId];
-    double rx = myRobot->getX();
-    double ry = myRobot->getY();
+    // GLOBAL COORDINATES: Align ARIA odometry with physical room offsets
+    double rx = myRobot->getX() + gOffsetX[myId];
+    double ry = myRobot->getY() + gOffsetY[myId];
     double th = myRobot->getTh();
     
     double dx = tx - rx;
     double dy = ty - ry;
     double distToTarget = sqrt(dx*dx + dy*dy);
     
+    // Calculate distance to origin to verify Return Home alignment
+    double dxHome = gOffsetX[myId] - rx;
+    double dyHome = gOffsetY[myId] - ry;
+    double distToHome = sqrt(dxHome*dxHome + dyHome*dyHome);
+    
     if (distToTarget < 300.0) {
-      // If the target is exactly (0,0) (Return Home command), we must also align heading to 0
-      if (fabs(tx) < 1.0 && fabs(ty) < 1.0) {
+      // If the target is our exact physical home offset, we must align heading to 0
+      if (distToHome < 300.0) {
           // Normalize heading difference to [-180, 180]
           double heading_diff = 0.0 - th;
           while (heading_diff > 180.0) heading_diff -= 360.0;
@@ -748,7 +766,7 @@ void MultiAgentArrowControl::controlTask()
               targetV = 0.0; // Stop moving forward
               targetW = heading_diff > 0 ? 15.0 : -15.0; // Spin in place slowly
           } else {
-              // Reached (0,0) and facing 0 degrees
+              // Reached (0,0) global relative to own start, facing 0 degrees
               gHasTarget[myId] = false; 
               targetV = 0.0;
               targetW = 0.0;
@@ -780,12 +798,30 @@ void MultiAgentArrowControl::controlTask()
         }
       }
       
+      // 2a. Shared Obstacle Repulsion (Crucial for Robot 1 which has no sonar)
+      if (myId == 1) {
+        pthread_mutex_lock(&gObstacleMutex);
+        for (int i = 0; i < gSharedObstacleCount; i++) {
+          double ox = gSharedObstacles[i].x;
+          double oy = gSharedObstacles[i].y;
+          double d = sqrt((rx - ox)*(rx - ox) + (ry - oy)*(ry - oy));
+          
+          if (d > 0.0 && d < 1200.0) {
+            double repel_mag = 150000.0 / (d * d); // tune force intensity
+            Fx -= repel_mag * (ox - rx) / d;
+            Fy -= repel_mag * (oy - ry) / d;
+          }
+        }
+        pthread_mutex_unlock(&gObstacleMutex);
+      }
+      
       // 2b. Inter-robot repulsion (avoid collisions when converging)
       for (size_t ci = 0; ci < gControllers.size(); ci++) {
         MultiAgentArrowControl* other = gControllers[ci];
         if (other->myId == myId) continue;
-        double ox = other->myRobot->getX();
-        double oy = other->myRobot->getY();
+        // MUST USE GLOBAL COORDINATES FOR INTER-ROBOT COLLISION AVOIDANCE
+        double ox = other->myRobot->getX() + gOffsetX[other->myId];
+        double oy = other->myRobot->getY() + gOffsetY[other->myId];
         double interDist = sqrt((rx-ox)*(rx-ox) + (ry-oy)*(ry-oy));
         if (interDist > 0.0 && interDist < 800.0) {
           double repel = 200000.0 / (interDist * interDist);
@@ -841,8 +877,8 @@ void MultiAgentArrowControl::controlTask()
     if (myId != 1) {
       // === ROBOTS WITH SONAR (2, 3): Use own sonar + contribute to shared map ===
       double frontMin = 5000.0, leftMin = 5000.0, rightMin = 5000.0;
-      double rx = myRobot->getX();
-      double ry = myRobot->getY();
+      double rx = myRobot->getX() + gOffsetX[myId];
+      double ry = myRobot->getY() + gOffsetY[myId];
       double rth = myRobot->getTh();
       
       for (int s = 0; s < 8; s++) {
@@ -874,8 +910,8 @@ void MultiAgentArrowControl::controlTask()
       }
     } else {
       // === ROBOT 1 (NO SONAR): Use shared obstacle map for consensus avoidance ===
-      double rx = myRobot->getX();
-      double ry = myRobot->getY();
+      double rx = myRobot->getX() + gOffsetX[myId];
+      double ry = myRobot->getY() + gOffsetY[myId];
       double rth = myRobot->getTh();
       
       pthread_mutex_lock(&gObstacleMutex);
@@ -915,37 +951,49 @@ void MultiAgentArrowControl::controlTask()
 
     // If we're not actively dodging a wall, follow Boids rules (like fish)
     if (!obstacle_avoiding) {
-      double myX = myRobot->getX();
-      double myY = myRobot->getY();
+      double myX = myRobot->getX() + gOffsetX[myId];
+      double myY = myRobot->getY() + gOffsetY[myId];
       double myTh = myRobot->getTh();
       
       double avgX = 0, avgY = 0, avgThX = 0, avgThY = 0;
+      double avgV = 0;
       int neighborCount = 0;
-      
       double sepX = 0, sepY = 0;
+      double minNeighborDist = 5000.0;
+      double leaderSpeed = 0.0;
       
-      // Calculate Boids vectors
+        // Calculate Boids vectors
       for (size_t i = 0; i < gControllers.size(); i++) {
         MultiAgentArrowControl* other = gControllers[i];
         if (other->myId == myId || !other->myRobot->isConnected()) continue;
         
-        double ox = other->myRobot->getX();
-        double oy = other->myRobot->getY();
+        // IMPORTANT: Fetch global physical coordinates of flock mates
+        double ox = other->myRobot->getX() + gOffsetX[other->myId];
+        double oy = other->myRobot->getY() + gOffsetY[other->myId];
         double oth = other->myRobot->getTh();
+        double ov = other->myRobot->getVel();
         double dist = sqrt((ox - myX)*(ox - myX) + (oy - myY)*(oy - myY));
         
-        // Only consider neighbors within 2.5 meters
+        if (dist > 0 && dist < minNeighborDist) {
+          minNeighborDist = dist;
+          leaderSpeed = ov; // Track the speed of the closest robot to match it
+        }
+        
+        // COHESION & ALIGNMENT: Only consider neighbors within 2.5 meters
         if (dist > 0 && dist < 2500.0) {
           avgX += ox;
           avgY += oy;
           avgThX += cos(oth * M_PI / 180.0);
           avgThY += sin(oth * M_PI / 180.0);
+          avgV += ov;
           neighborCount++;
         }
         
-        // SEPARATION: Critical collision avoidance (< 800mm)
-        if (dist > 0 && dist < 800.0) {
-          double force = (800.0 - dist) / 800.0; // Stronger as they get closer
+        // SEPARATION: Critical collision avoidance
+        // Boosted separation distance to 1500mm to guarantee no stacking and keep spaces split
+        if (dist > 0 && dist < 1500.0) {
+          double force = (1500.0 - dist) / 1500.0;
+          force = force * force; // Quadratic: pushes much harder when very close
           sepX -= (ox - myX) / dist * force;
           sepY -= (oy - myY) / dist * force;
         }
@@ -957,12 +1005,20 @@ void MultiAgentArrowControl::controlTask()
         // Average coordinates for COHESION
         avgX /= neighborCount;
         avgY /= neighborCount;
+        avgV /= neighborCount;
         
-        // Cohesion force (steer to center of flock)
-        double coh_angle = atan2(avgY - myY, avgX - myX) * 180.0 / M_PI;
-        
-        // ALIGNMENT force (steer to match average heading)
+        // ALIGNMENT force (average heading)
         double ali_angle = atan2(avgThY, avgThX) * 180.0 / M_PI;
+        
+        // Modify Cohesion for Robot 1: Follow behind the flock instead of rushing the center
+        if (myId == 1) {
+            // Target point is 800mm behind the center of the flock, along their heading
+            avgX -= 800.0 * cos(ali_angle * M_PI / 180.0);
+            avgY -= 800.0 * sin(ali_angle * M_PI / 180.0);
+        }
+        
+        // Cohesion force direction
+        double coh_angle = atan2(avgY - myY, avgX - myX) * 180.0 / M_PI;
         
         // Blend Cohesion (30%) and Alignment (70%)
         // We use vectors to blend angles safely
@@ -970,8 +1026,13 @@ void MultiAgentArrowControl::controlTask()
         double blendY = 0.3 * sin(coh_angle*M_PI/180.0) + 0.7 * sin(ali_angle*M_PI/180.0);
         
         // Apply Separation
-        blendX += sepX * 2.0; // Separation takes strong priority over flocking
-        blendY += sepY * 2.0;
+        if (myId == 1) {
+          blendX += sepX * 5.0; // R1 PANIC AVOIDANCE - Massive priority over flocking
+          blendY += sepY * 5.0;
+        } else {
+          blendX += sepX * 2.0; // Standard separation
+          blendY += sepY * 2.0;
+        }
         
         // Apply shared obstacle repulsion for Robot 1
         if (myId == 1) {
@@ -996,14 +1057,35 @@ void MultiAgentArrowControl::controlTask()
       
       boidsW = heading_diff * 0.5;
       
-      // SPEED CALCULATION
-      // Like a fish: swim faster (50-60mm/s) when going straight to catch up to the flock
-      // Swim slower (20-30mm/s) when making sharp turns to reorient
-      if (fabs(heading_diff) > 45.0) {
-        boidsV = 20.0; // Slow down for tight turns
+      // SPEED MATCHING & DISTANCE KEEPER
+      if (neighborCount > 0 && minNeighborDist < 2500.0) {
+        // Base speed: match the flock
+        boidsV = avgV;
+        
+        // P-Controller: Target a strict 1000mm (100cm) formation gap
+        double distanceError = minNeighborDist - 1000.0;
+        double speedAdjustment = distanceError * 0.05; // 50mm error = 2.5mm/s adjust
+        
+        // Clamp adjustment so it smoothly slides into place without violently accelerating
+        speedAdjustment = std::max(-20.0, std::min(20.0, speedAdjustment));
+        boidsV += speedAdjustment;
       } else {
-        // Linearly speed up the straighter we are going
-        boidsV = 30.0 + (30.0 * (1.0 - fabs(heading_diff)/45.0));
+        // No neighbors nearby, default exploration speed
+        boidsV = 30.0;
+      }
+      
+      // Slow down heavily for sharp turns so it doesn't swing wide
+      if (fabs(heading_diff) > 45.0) {
+        boidsV = std::min(boidsV, 15.0);
+      }
+      
+      // EXPLICIT PROXIMITY BRAKING: Absolute safety override
+      if (minNeighborDist < 800.0) {
+        // Dangerously close: Stop moving forward, just spin to escape
+        boidsV = 0.0;
+      } else if (minNeighborDist < 1200.0 && boidsV > 10.0) {
+        // Only brake to 10.0 if our P-controller is somehow pushing us faster than that
+        boidsV = std::min(boidsV, 10.0);
       }
     }
 
@@ -1356,6 +1438,71 @@ int main(int argc, char** argv)
     system("pkill -f roomMapper2D.py 2>/dev/null");
     ArUtil::sleep(200);
     system("python3 \"FYP codes/roomMapper2D.py\" &");
+
+    // ==========================================================
+    // AUTO-CALIBRATION PHASE (Robots 2 & 3 locate Robot 1)
+    // ==========================================================
+    ArLog::log(ArLog::Normal, "ArrowControl: Starting auto-calibration. Please ensure Robot 2 & 3 face Robot 1.");
+    ArUtil::sleep(2000); // Let sonar stabilize
+
+    double calib_d2 = 5000.0, calib_th2 = 0.0;
+    double calib_d3 = 5000.0, calib_th3 = 0.0;
+
+    for (size_t i = 0; i < robots.size(); ++i) {
+      if (robots[i].robot && robots[i].robot->isConnected()) {
+        int id = robots[i].id;
+        if (id == 2 || id == 3) {
+          // Average 10 readings for stability
+          double sum_dist = 0;
+          int valid_hits = 0;
+          for (int k = 0; k < 10; k++) {
+            double d = robots[i].robot->getClosestSonarRange(-10, 10);
+            if (d > 0 && d < 4000) {
+              sum_dist += d;
+              valid_hits++;
+            }
+            ArUtil::sleep(50);
+          }
+          if (valid_hits > 0) {
+            double avg_dist = sum_dist / valid_hits;
+            if (id == 2) {
+              calib_d2 = avg_dist;
+              calib_th2 = robots[i].robot->getTh();
+            } else if (id == 3) {
+              calib_d3 = avg_dist;
+              calib_th3 = robots[i].robot->getTh();
+            }
+          }
+        }
+      }
+    }
+
+    // Calculate Robot 1's true global offset locally in C++ so it stops hallucinating collisions!
+    if (calib_d2 < 5000.0 && calib_d3 < 5000.0) {
+      double estX2 = gOffsetX[2] + (calib_d2 + 250.0) * cos(calib_th2 * M_PI / 180.0);
+      double estY2 = gOffsetY[2] + (calib_d2 + 250.0) * sin(calib_th2 * M_PI / 180.0);
+      
+      double estX3 = gOffsetX[3] + (calib_d3 + 250.0) * cos(calib_th3 * M_PI / 180.0);
+      double estY3 = gOffsetY[3] + (calib_d3 + 250.0) * sin(calib_th3 * M_PI / 180.0);
+      
+      gOffsetX[1] = (estX2 + estX3) / 2.0;
+      gOffsetY[1] = (estY2 + estY3) / 2.0;
+      ArLog::log(ArLog::Normal, "ArrowControl: Robot 1 Global Offset synchronized to (%.0f, %.0f)", gOffsetX[1], gOffsetY[1]);
+    }
+
+    // Broadcast calibration message to Python
+    if (gUdpSocket >= 0) {
+      CalibrationMsg cmsg;
+      cmsg.type = 99; // Magic number for calibration
+      cmsg.d2 = calib_d2;
+      cmsg.th2 = calib_th2;
+      cmsg.d3 = calib_d3;
+      cmsg.th3 = calib_th3;
+      sendto(gUdpSocket, &cmsg, sizeof(cmsg), 0,
+             (struct sockaddr*)&gVisualizerAddr, sizeof(gVisualizerAddr));
+      ArLog::log(ArLog::Normal, "ArrowControl: Auto-calibration sent (R2: %.0fmm, R3: %.0fmm)", calib_d2, calib_d3);
+    }
+    // ==========================================================
 
     MultiAgentArrowControl::printUI();
 
