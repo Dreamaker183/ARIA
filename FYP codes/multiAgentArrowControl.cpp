@@ -74,6 +74,64 @@ static int gWaypointSocket = -1;
 
 static volatile bool gBoidsMode = false;
 
+// === SHARED OBSTACLE MAP (for consensus navigation) ===
+// Robots with sonar (2, 3) deposit obstacle hits here.
+// Robot 1 (no sonar) queries this map for obstacle avoidance.
+struct SharedObstacle {
+  double x, y;   // World coordinates of obstacle
+  int age;       // Incremented each cycle; removed after MAX_OBS_AGE
+};
+static const int MAX_SHARED_OBSTACLES = 200;
+static const int MAX_OBS_AGE = 50; // ~5 seconds at 10Hz control loop
+static SharedObstacle gSharedObstacles[MAX_SHARED_OBSTACLES];
+static int gSharedObstacleCount = 0;
+static pthread_mutex_t gObstacleMutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void addSharedObstacle(double ox, double oy) {
+  pthread_mutex_lock(&gObstacleMutex);
+  // Deduplicate: don't add if within 100mm of existing point
+  for (int i = 0; i < gSharedObstacleCount; i++) {
+    double dx = gSharedObstacles[i].x - ox;
+    double dy = gSharedObstacles[i].y - oy;
+    if (dx*dx + dy*dy < 100.0*100.0) {
+      gSharedObstacles[i].age = 0; // Refresh age
+      pthread_mutex_unlock(&gObstacleMutex);
+      return;
+    }
+  }
+  // Add new point (circular buffer)
+  if (gSharedObstacleCount < MAX_SHARED_OBSTACLES) {
+    gSharedObstacles[gSharedObstacleCount].x = ox;
+    gSharedObstacles[gSharedObstacleCount].y = oy;
+    gSharedObstacles[gSharedObstacleCount].age = 0;
+    gSharedObstacleCount++;
+  } else {
+    // Overwrite oldest
+    int oldest_idx = 0;
+    for (int i = 1; i < gSharedObstacleCount; i++) {
+      if (gSharedObstacles[i].age > gSharedObstacles[oldest_idx].age)
+        oldest_idx = i;
+    }
+    gSharedObstacles[oldest_idx].x = ox;
+    gSharedObstacles[oldest_idx].y = oy;
+    gSharedObstacles[oldest_idx].age = 0;
+  }
+  pthread_mutex_unlock(&gObstacleMutex);
+}
+
+static void ageSharedObstacles() {
+  pthread_mutex_lock(&gObstacleMutex);
+  int write = 0;
+  for (int i = 0; i < gSharedObstacleCount; i++) {
+    gSharedObstacles[i].age++;
+    if (gSharedObstacles[i].age < MAX_OBS_AGE) {
+      gSharedObstacles[write++] = gSharedObstacles[i];
+    }
+  }
+  gSharedObstacleCount = write;
+  pthread_mutex_unlock(&gObstacleMutex);
+}
+
 class MultiAgentArrowControl
 {
   friend void processRemoteCommands();
@@ -776,29 +834,83 @@ void MultiAgentArrowControl::controlTask()
     double boidsV = 30.0;  // Base forward speed (mm/s)
     double boidsW = 0.0;   // Rotation (deg/s)
 
-    // 1. Obstacle avoidance from sonar (Highest priority)
-    double frontMin = 5000.0, leftMin = 5000.0, rightMin = 5000.0;
-    for (int s = 0; s < 8; s++) {
-      ArSensorReading* r = myRobot->getSonarReading(s);
-      double d = r ? r->getRange() : 5000.0;
-      if (d <= 0) d = 5000.0;
-      double ang = r ? r->getSensorTh() : 0;
-      if (ang > -45 && ang < 45) frontMin = std::min(frontMin, d);
-      else if (ang >= 45) leftMin = std::min(leftMin, d);
-      else rightMin = std::min(rightMin, d);
-    }
-
+    // 1. Obstacle avoidance
     bool obstacle_avoiding = false;
-    if (frontMin < 500.0) {
-      // Obstacle ahead — slow down significantly and turn sharply
-      boidsV = 10.0;
-      boidsW = (leftMin > rightMin) ? 20.0 : -20.0;
-      obstacle_avoiding = true;
-    } else if (frontMin < 1000.0) {
-      // Obstacle approaching — slow down slightly and start turning
-      boidsV = 25.0;
-      boidsW = (leftMin > rightMin) ? 10.0 : -10.0;
-      obstacle_avoiding = true;
+    double boidsObsRepX = 0, boidsObsRepY = 0; // Obstacle repulsion vector for Robot 1
+    
+    if (myId != 1) {
+      // === ROBOTS WITH SONAR (2, 3): Use own sonar + contribute to shared map ===
+      double frontMin = 5000.0, leftMin = 5000.0, rightMin = 5000.0;
+      double rx = myRobot->getX();
+      double ry = myRobot->getY();
+      double rth = myRobot->getTh();
+      
+      for (int s = 0; s < 8; s++) {
+        ArSensorReading* r = myRobot->getSonarReading(s);
+        double d = r ? r->getRange() : 5000.0;
+        if (d <= 0) d = 5000.0;
+        double ang = r ? r->getSensorTh() : 0;
+        if (ang > -45 && ang < 45) frontMin = std::min(frontMin, d);
+        else if (ang >= 45) leftMin = std::min(leftMin, d);
+        else rightMin = std::min(rightMin, d);
+        
+        // Contribute close hits to shared obstacle map
+        if (d < 2500.0 && d > 50.0) {
+          double worldAngle = (rth + ang) * M_PI / 180.0;
+          double hitX = rx + d * cos(worldAngle);
+          double hitY = ry + d * sin(worldAngle);
+          addSharedObstacle(hitX, hitY);
+        }
+      }
+
+      if (frontMin < 500.0) {
+        boidsV = 10.0;
+        boidsW = (leftMin > rightMin) ? 20.0 : -20.0;
+        obstacle_avoiding = true;
+      } else if (frontMin < 1000.0) {
+        boidsV = 25.0;
+        boidsW = (leftMin > rightMin) ? 10.0 : -10.0;
+        obstacle_avoiding = true;
+      }
+    } else {
+      // === ROBOT 1 (NO SONAR): Use shared obstacle map for consensus avoidance ===
+      double rx = myRobot->getX();
+      double ry = myRobot->getY();
+      double rth = myRobot->getTh();
+      
+      pthread_mutex_lock(&gObstacleMutex);
+      for (int i = 0; i < gSharedObstacleCount; i++) {
+        double dx = gSharedObstacles[i].x - rx;
+        double dy = gSharedObstacles[i].y - ry;
+        double dist = sqrt(dx*dx + dy*dy);
+        
+        if (dist > 0 && dist < 1500.0) {
+          // Virtual repulsive force pushing away from obstacle
+          double force = (1500.0 - dist) / 1500.0;
+          force = force * force; // Quadratic falloff — stronger when closer
+          boidsObsRepX -= (dx / dist) * force;
+          boidsObsRepY -= (dy / dist) * force;
+          
+          // Check if obstacle is "in front" of Robot 1
+          double obsAngle = atan2(dy, dx) * 180.0 / M_PI;
+          double angleDiff = obsAngle - rth;
+          while (angleDiff > 180.0) angleDiff -= 360.0;
+          while (angleDiff < -180.0) angleDiff += 360.0;
+          
+          if (fabs(angleDiff) < 60.0 && dist < 500.0) {
+            boidsV = 10.0;
+            obstacle_avoiding = true;
+          } else if (fabs(angleDiff) < 60.0 && dist < 1000.0) {
+            boidsV = std::min(boidsV, 25.0);
+          }
+        }
+      }
+      pthread_mutex_unlock(&gObstacleMutex);
+    }
+    
+    // Age out old shared obstacles (only one robot needs to do this)
+    if (myId == 1) {
+      ageSharedObstacles();
     }
 
     // If we're not actively dodging a wall, follow Boids rules (like fish)
@@ -860,6 +972,12 @@ void MultiAgentArrowControl::controlTask()
         // Apply Separation
         blendX += sepX * 2.0; // Separation takes strong priority over flocking
         blendY += sepY * 2.0;
+        
+        // Apply shared obstacle repulsion for Robot 1
+        if (myId == 1) {
+          blendX += boidsObsRepX * 3.0; // Strong obstacle avoidance
+          blendY += boidsObsRepY * 3.0;
+        }
         
         target_heading = atan2(blendY, blendX) * 180.0 / M_PI;
       } else {
